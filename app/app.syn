@@ -1,0 +1,537 @@
+-- Agent treasury on Vela: the LLM stays outside, the policy lives inside. An agent (any process
+-- holding a proposer key) proposes payments; this app, inside the enclave, applies the policy the
+-- owner set — who may propose, who may be paid and up to how much, the automatic limit per
+-- payment, the allowance the owner granted — and either pays at once through the trigger
+-- contract or holds the proposal for the owner's approval. Every decision is deterministic and
+-- lands in the audit report. This file is the WHOLE application: it is embedded into the guest
+-- module (`scripts/build.sh` → build/app.wasm), so the SHA-256 Vela verifies on-chain covers it.
+--
+-- Entry points (one map in, one map out; see https://synsema.dev/en/0.6.x/73-vela):
+--   deploy(ctx)       params {"owner", "triggerContract", "token"?, "max_auto"?, "allowance"?, "proposers"?, "payees"?}
+--   deposit(ctx)      only the app's token; credits the treasury (the owner gets the event)
+--   process(ctx)      {"type": "propose", "payee", "amount", "memo"?}                     a proposer
+--                     {"type": "approve" | "reject", "id", "reason"?}                       the owner
+--                     {"type": "policy", "max_auto"? | "grant"? | "allowance"? | "allow_payee"? | "deny_payee"? | "allow_proposer"? | "deny_proposer"?}
+--                     {"type": "withdraw", "amount", "to"?}                                 the owner
+--   trusted(ctx)      abi(bytes16 id, uint8 outcome) from the trigger: settles or refunds a payment
+--   deanonymize(ctx)  {"report_type"?: "audit" | "ledger" | "policy", "status"?}         an allowed authority
+--
+-- Amounts are the token's smallest unit as decimal TEXT (USDC: "150000000" is 150.00). The client
+-- converts from human amounts. No clock, no randomness: a "daily" budget is whatever the owner
+-- grants each day from outside. Test natively before building: `synsema test app/app.syn`.
+intent: "vela app: agent treasury — an agent proposes payments, the enclave applies the owner's policy, a trigger contract pays"
+
+let ETH be "0x0000000000000000000000000000000000000000"
+let MAX_LEDGER be 2000
+
+task hex_of(b)
+    give "0x" + decode(b, "hex")
+
+task hex_bytes(h)
+    give bytes(slice(h, 2, length(h)), "hex")
+
+task is_address(a)
+    give a != nothing and starts_with(lower(text(a)), "0x") and length(text(a)) == 42 and matches(slice(text(a), 2, 42), "[0-9a-fA-F]+")
+
+task dec(v)
+    give decimal(text(v))
+
+task field(m, key, default)
+    when m != nothing and contains(m, key) and m[key] != nothing
+        give m[key]
+    give default
+
+-- ---- state ----
+
+task new_state(app_id, owner, token, trigger, max_auto, allowance)
+    give {"app_id": app_id, "owner": owner, "token": token, "trigger": trigger, "balance": "0", "policy": {"max_auto": max_auto, "allowance": allowance, "proposers": {}, "payees": {}}, "proposals": {}, "proposal_nonce": 0, "nonce": 0}
+
+task bump(state)
+    set state["nonce"] to state["nonce"] + 1
+    give state
+
+-- One event per user: when the proposer is the owner, the owner's event is the one that goes out.
+task events_for(owner, proposer, owner_event, proposer_event)
+    when proposer == owner or proposer == nothing
+        give [{"user": owner, "data": owner_event}]
+    give [{"user": owner, "data": owner_event}, {"user": proposer, "data": proposer_event}]
+
+task summary(p)
+    give {"id": p["id"], "n": p["n"], "proposer": p["proposer"], "payee": p["payee"], "amount": p["amount"], "memo": p["memo"], "status": p["status"], "reasons": p["reasons"]}
+
+-- ---- entry points ----
+
+task deploy(ctx)
+    let params be ctx["params"]
+    when params == nothing or not is_address(field(params, "owner", nothing))
+        give {"error": "deploy needs constructorParams {\"owner\": \"0x…\", \"triggerContract\": \"0x…\", \"token\"?: \"0x…\", \"max_auto\"?: \"<units>\"}"}
+    when not is_address(field(params, "triggerContract", nothing))
+        give {"error": "deploy needs the trigger contract that pays: \"triggerContract\": \"0x…\" (also passed to submitDeployRequestWithTrigger)"}
+    let token be field(params, "token", ETH)
+    when token == ""
+        set token to ETH
+    when not is_address(token)
+        give {"error": "invalid token address " + text(token)}
+    let state be new_state(ctx["app_id"], lower(params["owner"]), lower(token), lower(params["triggerContract"]), text(field(params, "max_auto", "0")), text(field(params, "allowance", "0")))
+    let policy be state["policy"]
+    each addr in keys(field(params, "proposers", {}))
+        when not is_address(addr)
+            give {"error": "invalid proposer address " + text(addr)}
+        let proposers be policy["proposers"]
+        set proposers[lower(addr)] to text(params["proposers"][addr])
+        set policy["proposers"] to proposers
+    each addr in keys(field(params, "payees", {}))
+        when not is_address(addr)
+            give {"error": "invalid payee address " + text(addr)}
+        let entry be params["payees"][addr]
+        let payees be policy["payees"]
+        set payees[lower(addr)] to {"label": text(field(entry, "label", "")), "cap": text(field(entry, "cap", ""))}
+        set policy["payees"] to payees
+    set state["policy"] to policy
+    give {"state": state, "fuel": "5"}
+
+-- Cache warm-up after an Executor restart; the state returned here is discarded.
+task load_module(ctx)
+    give {"state": new_state(ctx["app_id"], "", ETH, "", "0", "0"), "fuel": "5"}
+
+task deposit(ctx)
+    let state be ctx["state"]
+    when lower(ctx["token"]) != state["token"]
+        give {"error": "this treasury holds " + state["token"] + ", not " + lower(ctx["token"])}
+    let after be dec(state["balance"]) + dec(ctx["value"])
+    set state["balance"] to text(after)
+    let s1 be bump(state)
+    let event be {"type": "deposit", "origin": ctx["sender"], "amount": ctx["value"], "balance": text(after), "nonce": s1["nonce"]}
+    give {"state": s1, "events": [{"user": state["owner"], "data": event}], "fuel": "35"}
+
+task process(ctx)
+    let payload be ctx["payload"]
+    when payload == nothing or not contains(payload, "type")
+        give {"error": "payload needs a \"type\": propose | approve | reject | policy | withdraw"}
+    match payload["type"]
+        is "propose"
+            give propose(ctx, ctx["state"], payload)
+        is "approve"
+            give approve(ctx, ctx["state"], payload)
+        is "reject"
+            give reject(ctx, ctx["state"], payload)
+        is "policy"
+            give policy(ctx, ctx["state"], payload)
+        is "withdraw"
+            give withdraw(ctx, ctx["state"], payload)
+        otherwise
+            give {"error": "unsupported instruction type: " + text(payload["type"])}
+
+-- ---- the policy (owner only) ----
+
+task policy(ctx, state, p)
+    when ctx["sender"] != state["owner"]
+        give {"error": "only the owner sets the policy"}
+    let pol be state["policy"]
+    let changes be []
+    when contains(p, "max_auto") and p["max_auto"] != nothing
+        when dec(p["max_auto"]) < dec("0")
+            give {"error": "max_auto must be zero or positive"}
+        set pol["max_auto"] to text(dec(p["max_auto"]))
+        set changes to append(changes, "max_auto " + pol["max_auto"])
+    when contains(p, "grant") and p["grant"] != nothing
+        when dec(p["grant"]) <= dec("0")
+            give {"error": "a grant must be positive"}
+        set pol["allowance"] to text(dec(pol["allowance"]) + dec(p["grant"]))
+        set changes to append(changes, "granted " + text(dec(p["grant"])) + " → allowance " + pol["allowance"])
+    when contains(p, "allowance") and p["allowance"] != nothing
+        when dec(p["allowance"]) < dec("0")
+            give {"error": "allowance must be zero or positive"}
+        set pol["allowance"] to text(dec(p["allowance"]))
+        set changes to append(changes, "allowance " + pol["allowance"])
+    when contains(p, "allow_payee") and p["allow_payee"] != nothing
+        let e be p["allow_payee"]
+        when not is_address(field(e, "address", nothing))
+            give {"error": "allow_payee needs an address"}
+        let payees be pol["payees"]
+        set payees[lower(e["address"])] to {"label": text(field(e, "label", "")), "cap": when field(e, "cap", "") == "" then "" otherwise text(dec(e["cap"]))}
+        set pol["payees"] to payees
+        set changes to append(changes, "payee " + lower(e["address"]) + " allowed")
+    when contains(p, "deny_payee") and p["deny_payee"] != nothing
+        let kept be {}
+        each k in keys(pol["payees"])
+            when k != lower(p["deny_payee"])
+                set kept[k] to pol["payees"][k]
+        set pol["payees"] to kept
+        set changes to append(changes, "payee " + lower(p["deny_payee"]) + " denied")
+    when contains(p, "allow_proposer") and p["allow_proposer"] != nothing
+        let e be p["allow_proposer"]
+        when not is_address(field(e, "address", nothing))
+            give {"error": "allow_proposer needs an address"}
+        let proposers be pol["proposers"]
+        set proposers[lower(e["address"])] to text(field(e, "label", ""))
+        set pol["proposers"] to proposers
+        set changes to append(changes, "proposer " + lower(e["address"]) + " allowed")
+    when contains(p, "deny_proposer") and p["deny_proposer"] != nothing
+        let kept be {}
+        each k in keys(pol["proposers"])
+            when k != lower(p["deny_proposer"])
+                set kept[k] to pol["proposers"][k]
+        set pol["proposers"] to kept
+        set changes to append(changes, "proposer " + lower(p["deny_proposer"]) + " denied")
+    when length(changes) == 0
+        give {"error": "policy: nothing to change (max_auto, grant, allowance, allow_payee, deny_payee, allow_proposer, deny_proposer)"}
+    set state["policy"] to pol
+    let s1 be bump(state)
+    let event be {"type": "policy", "changes": changes, "max_auto": pol["max_auto"], "allowance": pol["allowance"], "payees": length(keys(pol["payees"])), "proposers": length(keys(pol["proposers"])), "balance": s1["balance"], "nonce": s1["nonce"]}
+    give {"state": s1, "events": [{"user": state["owner"], "data": event}], "fuel": "35"}
+
+-- ---- proposals ----
+
+-- Pays now: the funds leave for the trigger contract, which transfers them to the payee and
+-- reports back through `trusted`. The public app event is what the trigger decodes.
+task execute_now(state, proposal, auto)
+    let amount be dec(proposal["amount"])
+    set state["balance"] to text(dec(state["balance"]) - amount)
+    when auto
+        let pol be state["policy"]
+        set pol["allowance"] to text(dec(pol["allowance"]) - amount)
+        set state["policy"] to pol
+    set proposal["status"] to "executing"
+    set proposal["auto"] to auto
+    let proposals be state["proposals"]
+    set proposals[proposal["id"]] to proposal
+    set state["proposals"] to proposals
+    let s1 be bump(state)
+    let call be abi_encode("pay(bytes16,address,address,uint256)", [hex_bytes(proposal["id"]), proposal["payee"], s1["token"], amount])
+    let app_event be {"subtype": "payment", "data_hex": hex_of(slice(call, 4, length(call)))}
+    let owner_event be {"type": "payment", "proposal": summary(proposal), "auto": auto, "balance": s1["balance"], "allowance": s1["policy"]["allowance"], "nonce": s1["nonce"]}
+    let proposer_event be {"type": "proposal", "id": proposal["id"], "n": proposal["n"], "status": "executing", "reasons": [], "nonce": s1["nonce"]}
+    give {"state": s1, "events": events_for(s1["owner"], proposal["proposer"], owner_event, proposer_event), "app_events": [app_event], "withdrawals": [{"token": s1["token"], "to": s1["trigger"], "amount": text(amount)}], "fuel": "60"}
+
+task propose(ctx, state, p)
+    let pol be state["policy"]
+    let proposer be ctx["sender"]
+    when not contains(pol["proposers"], proposer)
+        give {"error": "not a proposer: " + text(proposer)}
+    when not is_address(field(p, "payee", nothing))
+        give {"error": "propose needs a payee address"}
+    when field(p, "amount", nothing) == nothing
+        give {"error": "propose needs an amount"}
+    let amount be dec(p["amount"])
+    when amount <= dec("0")
+        give {"error": "amounts must be positive"}
+    let payee be lower(p["payee"])
+    let memo be text(field(p, "memo", ""))
+    let reasons be []
+    when not contains(pol["payees"], payee)
+        set reasons to append(reasons, "payee not allowlisted")
+    when contains(pol["payees"], payee) and pol["payees"][payee]["cap"] != "" and amount > dec(pol["payees"][payee]["cap"])
+        set reasons to append(reasons, "over the payee's cap " + pol["payees"][payee]["cap"])
+    when amount > dec(pol["max_auto"])
+        set reasons to append(reasons, "over the automatic limit " + pol["max_auto"])
+    when amount > dec(pol["allowance"])
+        set reasons to append(reasons, "over the remaining allowance " + pol["allowance"])
+    when amount > dec(state["balance"])
+        set reasons to append(reasons, "treasury balance " + state["balance"] + " is short")
+    let n be state["proposal_nonce"] + 1
+    set state["proposal_nonce"] to n
+    let id be hex_of(int_to_bytes(n, 16))
+    let proposal be {"id": id, "n": n, "proposer": proposer, "payee": payee, "amount": text(amount), "memo": memo, "status": "pending", "reasons": reasons, "auto": false}
+    let s0 be prune(state)
+    when length(reasons) == 0
+        give execute_now(s0, proposal, true)
+    let proposals be s0["proposals"]
+    set proposals[id] to proposal
+    set s0["proposals"] to proposals
+    let s1 be bump(s0)
+    let owner_event be {"type": "approval_needed", "proposal": summary(proposal), "balance": s1["balance"], "allowance": pol["allowance"], "nonce": s1["nonce"]}
+    let proposer_event be {"type": "proposal", "id": id, "n": n, "status": "pending", "reasons": reasons, "nonce": s1["nonce"]}
+    give {"state": s1, "events": events_for(s1["owner"], proposer, owner_event, proposer_event), "fuel": "50"}
+
+task find_proposal(state, p)
+    let id be field(p, "id", nothing)
+    when id == nothing
+        give nothing
+    when not contains(state["proposals"], lower(text(id)))
+        give nothing
+    give state["proposals"][lower(text(id))]
+
+task approve(ctx, state, p)
+    when ctx["sender"] != state["owner"]
+        give {"error": "only the owner approves"}
+    let proposal be find_proposal(state, p)
+    when proposal == nothing
+        give {"error": "unknown proposal " + text(field(p, "id", ""))}
+    when proposal["status"] != "pending"
+        give {"error": "proposal " + proposal["id"] + " is " + proposal["status"] + ", not pending"}
+    when dec(proposal["amount"]) > dec(state["balance"])
+        give {"error": "fund the treasury first: balance " + state["balance"] + " < " + proposal["amount"]}
+    give execute_now(state, proposal, false)
+
+task reject(ctx, state, p)
+    when ctx["sender"] != state["owner"]
+        give {"error": "only the owner rejects"}
+    let proposal be find_proposal(state, p)
+    when proposal == nothing
+        give {"error": "unknown proposal " + text(field(p, "id", ""))}
+    when proposal["status"] != "pending"
+        give {"error": "proposal " + proposal["id"] + " is " + proposal["status"] + ", not pending"}
+    set proposal["status"] to "rejected"
+    set proposal["reasons"] to append(proposal["reasons"], "rejected by the owner" + (when field(p, "reason", "") == "" then "" otherwise ": " + text(p["reason"])))
+    let proposals be state["proposals"]
+    set proposals[proposal["id"]] to proposal
+    set state["proposals"] to proposals
+    let s1 be bump(state)
+    let owner_event be {"type": "rejected", "proposal": summary(proposal), "nonce": s1["nonce"]}
+    let proposer_event be {"type": "proposal", "id": proposal["id"], "n": proposal["n"], "status": "rejected", "reasons": proposal["reasons"], "nonce": s1["nonce"]}
+    give {"state": s1, "events": events_for(s1["owner"], proposal["proposer"], owner_event, proposer_event), "fuel": "35"}
+
+-- The owner takes funds out: a pull-payment to `to` (default the owner), claimed with claim(token, to).
+task withdraw(ctx, state, p)
+    when ctx["sender"] != state["owner"]
+        give {"error": "only the owner withdraws"}
+    when field(p, "amount", nothing) == nothing
+        give {"error": "withdraw needs an amount"}
+    let amount be dec(p["amount"])
+    when amount <= dec("0")
+        give {"error": "amounts must be positive"}
+    when amount > dec(state["balance"])
+        give {"error": "insufficient balance: " + state["balance"] + " < " + text(amount)}
+    let dest be lower(text(field(p, "to", state["owner"])))
+    when not is_address(dest) or dest == state["trigger"]
+        give {"error": "invalid destination address " + dest}
+    set state["balance"] to text(dec(state["balance"]) - amount)
+    let s1 be bump(state)
+    let event be {"type": "withdrawal", "to": dest, "amount": text(amount), "balance": s1["balance"], "nonce": s1["nonce"]}
+    give {"state": s1, "events": [{"user": s1["owner"], "data": event}], "withdrawals": [{"token": s1["token"], "to": dest, "amount": text(amount)}], "fuel": "50"}
+
+-- TRUSTPROCESS from the trigger: abi.encode(bytes16 id, uint8 outcome). 0 = paid; anything else =
+-- the transfer reverted and the endpoint swept the funds back, so the treasury is refunded.
+task trusted(ctx)
+    when ctx["payload_hex"] == nothing
+        give {"error": "trusted request without a payload"}
+    let decoded be abi_decode("(bytes16,uint8)", hex_bytes(ctx["payload_hex"]))
+    let id be hex_of(decoded[0])
+    let state be ctx["state"]
+    when not contains(state["proposals"], id)
+        give {"error": "unknown proposal " + id}
+    let proposal be state["proposals"][id]
+    when proposal["status"] != "executing"
+        give {"error": "proposal " + id + " is " + proposal["status"] + ", not executing (a replayed outcome?)"}
+    let paid be decoded[1] == 0
+    set proposal["status"] to when paid then "settled" otherwise "failed"
+    when not paid
+        set state["balance"] to text(dec(state["balance"]) + dec(proposal["amount"]))
+        set proposal["reasons"] to append(proposal["reasons"], "the trigger's transfer failed; funds returned")
+        when proposal["auto"]
+            let pol be state["policy"]
+            set pol["allowance"] to text(dec(pol["allowance"]) + dec(proposal["amount"]))
+            set state["policy"] to pol
+    let proposals be state["proposals"]
+    set proposals[id] to proposal
+    set state["proposals"] to proposals
+    let s1 be bump(state)
+    let owner_event be {"type": proposal["status"], "proposal": summary(proposal), "balance": s1["balance"], "allowance": s1["policy"]["allowance"], "nonce": s1["nonce"]}
+    let proposer_event be {"type": "proposal", "id": id, "n": proposal["n"], "status": proposal["status"], "reasons": proposal["reasons"], "nonce": s1["nonce"]}
+    give {"state": s1, "events": events_for(s1["owner"], proposal["proposer"], owner_event, proposer_event), "fuel": "50"}
+
+-- Keeps the ledger bounded: past MAX_LEDGER, the oldest closed proposals go (open ones never do).
+task prune(state)
+    when length(keys(state["proposals"])) < MAX_LEDGER
+        give state
+    let kept be {}
+    let dropped be 0
+    each k in keys(state["proposals"])
+        let p be state["proposals"][k]
+        when dropped < 100 and (p["status"] == "settled" or p["status"] == "rejected" or p["status"] == "failed")
+            set dropped to dropped + 1
+        otherwise
+            set kept[k] to p
+    set state["proposals"] to kept
+    give state
+
+-- ---- the audit (request type 2, an allowed authority) ----
+
+task deanonymize(ctx)
+    let state be ctx["state"]
+    let payload be ctx["payload"]
+    let report_type be text(field(payload, "report_type", "audit"))
+    let status be field(payload, "status", nothing)
+    let ledger be []
+    each k in keys(state["proposals"])
+        let p be state["proposals"][k]
+        when status == nothing or p["status"] == status
+            set ledger to append(ledger, p)
+    match report_type
+        is "audit"
+            give {"report": {"owner": state["owner"], "token": state["token"], "trigger": state["trigger"], "balance": state["balance"], "policy": state["policy"], "proposals": ledger}, "fuel": "20"}
+        is "ledger"
+            give {"report": {"proposals": ledger}, "fuel": "20"}
+        is "policy"
+            give {"report": {"balance": state["balance"], "policy": state["policy"]}, "fuel": "20"}
+        otherwise
+            give {"error": "unsupported report type: " + report_type}
+
+-- ---------------------------------------------------------------------------------------
+-- Tests: `synsema test app/app.syn`. The same code runs inside the enclave.
+-- ---------------------------------------------------------------------------------------
+
+let CFO be "0x1111111111111111111111111111111111111111"
+let AGENT be "0x2222222222222222222222222222222222222222"
+let VENDOR be "0x3333333333333333333333333333333333333333"
+let STRANGER be "0x4444444444444444444444444444444444444444"
+let TRIGGER be "0x5555555555555555555555555555555555555555"
+let USDC be "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48"
+let ID1 be "0x00000000000000000000000000000001"
+
+task treasury()
+    let params be {"owner": CFO, "token": USDC, "triggerContract": TRIGGER, "max_auto": "200", "allowance": "500", "proposers": {AGENT: "invoice agent"}, "payees": {VENDOR: {"label": "cloud vendor", "cap": "300"}}}
+    give deploy({"app_id": 1, "kind": "deploy", "params": params})["state"]
+
+task funded(units)
+    give deposit({"app_id": 1, "sender": CFO, "token": USDC, "value": units, "value_hex": "0x0", "state": treasury()})["state"]
+
+task send(state, sender, payload)
+    give process({"app_id": 1, "sender": sender, "request_type": 1, "kind": "process", "payload": payload, "payload_hex": nothing, "state": state})
+
+task outcome(state, id, code)
+    let call be abi_encode("f(bytes16,uint8)", [hex_bytes(id), code])
+    give trusted({"app_id": 1, "kind": "trusted", "request_type": 4, "sender": nothing, "payload": nothing, "payload_hex": hex_of(slice(call, 4, length(call))), "state": state})
+
+test "deploy needs the owner and the trigger; token, limits and lists have defaults"
+    let s be treasury()
+    assert_eq(s["owner"], CFO)
+    assert_eq(s["trigger"], TRIGGER)
+    assert_eq(s["policy"]["max_auto"], "200")
+    assert_eq(s["policy"]["proposers"][AGENT], "invoice agent")
+    assert_eq(s["policy"]["payees"][VENDOR]["cap"], "300")
+    let bare be deploy({"app_id": 2, "kind": "deploy", "params": {"owner": CFO, "triggerContract": TRIGGER}})["state"]
+    assert_eq(bare["token"], ETH)
+    assert_eq(bare["policy"]["max_auto"], "0")
+    assert_eq(bare["policy"]["allowance"], "0")
+    assert(starts_with(deploy({"app_id": 2, "kind": "deploy", "params": {"owner": CFO}})["error"], "deploy needs the trigger"))
+    assert(starts_with(deploy({"app_id": 2, "kind": "deploy", "params": nothing})["error"], "deploy needs constructorParams"))
+
+test "deposits credit the treasury, only in its token, and tell the owner"
+    let r be deposit({"app_id": 1, "sender": STRANGER, "token": USDC, "value": "1000", "value_hex": "0x0", "state": treasury()})
+    assert_eq(r["state"]["balance"], "1000")
+    assert_eq(r["events"][0]["user"], CFO)
+    assert_eq(r["events"][0]["data"]["origin"], STRANGER)
+    let bad be deposit({"app_id": 1, "sender": CFO, "token": ETH, "value": "1", "value_hex": "0x1", "state": treasury()})
+    assert(starts_with(bad["error"], "this treasury holds"))
+
+test "a proposal inside the policy is paid at once through the trigger"
+    let r be send(funded("1000"), AGENT, {"type": "propose", "payee": VENDOR, "amount": "150", "memo": "INV-1001"})
+    assert_eq(r["state"]["balance"], "850")
+    assert_eq(r["state"]["policy"]["allowance"], "350")
+    assert_eq(r["state"]["proposals"][ID1]["status"], "executing")
+    assert_eq(r["state"]["proposals"][ID1]["auto"], true)
+    assert_eq(r["withdrawals"], [{"token": USDC, "to": TRIGGER, "amount": "150"}])
+    assert_eq(r["app_events"][0]["subtype"], "payment")
+    let decoded be abi_decode("(bytes16,address,address,uint256)", hex_bytes(r["app_events"][0]["data_hex"]))
+    assert_eq(hex_of(decoded[0]), ID1)
+    assert_eq(lower(decoded[1]), VENDOR)
+    assert_eq(lower(decoded[2]), USDC)
+    assert_eq(text(decoded[3]), "150")
+    assert_eq(r["events"][0]["user"], CFO)
+    assert_eq(r["events"][0]["data"]["type"], "payment")
+    assert_eq(r["events"][1]["user"], AGENT)
+    assert_eq(r["events"][1]["data"]["status"], "executing")
+
+-- Maps are passed by reference and the entry points mutate the state they receive (as Vela's
+-- fresh state per call allows), so every scenario below starts from a freshly built state.
+task pending_state()
+    give send(funded("1000"), AGENT, {"type": "propose", "payee": VENDOR, "amount": "250", "memo": "INV-1002"})["state"]
+
+task paying_state()
+    give send(funded("1000"), AGENT, {"type": "propose", "payee": VENDOR, "amount": "150"})["state"]
+
+test "outside the policy a proposal waits for the owner, with every reason"
+    let over be send(funded("1000"), AGENT, {"type": "propose", "payee": VENDOR, "amount": "250", "memo": "INV-1002"})
+    assert_eq(over["state"]["proposals"][ID1]["status"], "pending")
+    assert_eq(over["state"]["proposals"][ID1]["reasons"], ["over the automatic limit 200"])
+    assert_eq(over["state"]["balance"], "1000")
+    assert_eq(over["state"]["policy"]["allowance"], "500")
+    assert(not contains(over, "withdrawals"))
+    assert_eq(over["events"][0]["data"]["type"], "approval_needed")
+    let unknown be send(funded("1000"), AGENT, {"type": "propose", "payee": STRANGER, "amount": "10"})
+    assert_eq(unknown["state"]["proposals"][ID1]["reasons"], ["payee not allowlisted"])
+    let big be send(funded("1000"), AGENT, {"type": "propose", "payee": VENDOR, "amount": "2000"})
+    assert_eq(big["state"]["proposals"][ID1]["reasons"], ["over the payee's cap 300", "over the automatic limit 200", "over the remaining allowance 500", "treasury balance 1000 is short"])
+    let intruder be send(funded("1000"), STRANGER, {"type": "propose", "payee": VENDOR, "amount": "1"})
+    assert(starts_with(intruder["error"], "not a proposer"))
+    let zero be send(funded("1000"), AGENT, {"type": "propose", "payee": VENDOR, "amount": "0"})
+    assert_eq(zero["error"], "amounts must be positive")
+
+test "the owner approves or rejects; an approval pays without touching the allowance"
+    let nope be send(pending_state(), AGENT, {"type": "approve", "id": ID1})
+    assert_eq(nope["error"], "only the owner approves")
+    let ok be send(pending_state(), CFO, {"type": "approve", "id": ID1})
+    assert_eq(ok["state"]["proposals"][ID1]["status"], "executing")
+    assert_eq(ok["state"]["proposals"][ID1]["auto"], false)
+    assert_eq(ok["state"]["balance"], "750")
+    assert_eq(ok["state"]["policy"]["allowance"], "500")
+    assert_eq(ok["withdrawals"][0]["amount"], "250")
+    let twice be send(ok["state"], CFO, {"type": "approve", "id": ID1})
+    assert(starts_with(twice["error"], "proposal " + ID1 + " is executing"))
+    let no be send(pending_state(), CFO, {"type": "reject", "id": ID1, "reason": "duplicate invoice"})
+    assert_eq(no["state"]["proposals"][ID1]["status"], "rejected")
+    assert_eq(no["state"]["proposals"][ID1]["reasons"], ["over the automatic limit 200", "rejected by the owner: duplicate invoice"])
+    assert_eq(no["state"]["balance"], "1000")
+    assert_eq(no["events"][1]["data"]["status"], "rejected")
+    let broke be send(send(funded("100"), AGENT, {"type": "propose", "payee": VENDOR, "amount": "250"})["state"], CFO, {"type": "approve", "id": ID1})
+    assert(starts_with(broke["error"], "fund the treasury first"))
+    -- a plain number is not an id: the client turns 1 into 0x…01
+    assert(starts_with(send(pending_state(), CFO, {"type": "approve", "id": "1"})["error"], "unknown proposal"))
+
+test "the trigger's outcome settles a payment, or refunds it (allowance included) when the transfer failed"
+    let settled be outcome(paying_state(), ID1, 0)
+    assert_eq(settled["state"]["proposals"][ID1]["status"], "settled")
+    assert_eq(settled["state"]["balance"], "850")
+    assert(not contains(settled, "app_events"))
+    assert_eq(settled["events"][0]["data"]["type"], "settled")
+    assert_eq(settled["events"][1]["data"]["status"], "settled")
+    let failed be outcome(paying_state(), ID1, 1)
+    assert_eq(failed["state"]["proposals"][ID1]["status"], "failed")
+    assert_eq(failed["state"]["balance"], "1000")
+    assert_eq(failed["state"]["policy"]["allowance"], "500")
+    let replay be outcome(settled["state"], ID1, 0)
+    assert(starts_with(replay["error"], "proposal " + ID1 + " is settled"))
+    assert(starts_with(outcome(paying_state(), "0x00000000000000000000000000000009", 0)["error"], "unknown proposal"))
+
+test "the owner shapes the policy; nobody else does"
+    let s be treasury()
+    let r be send(s, CFO, {"type": "policy", "grant": "100", "max_auto": "50", "allow_payee": {"address": STRANGER, "label": "new vendor"}, "allow_proposer": {"address": CFO, "label": "the CFO"}})
+    assert_eq(r["state"]["policy"]["allowance"], "600")
+    assert_eq(r["state"]["policy"]["max_auto"], "50")
+    assert_eq(r["state"]["policy"]["payees"][STRANGER], {"label": "new vendor", "cap": ""})
+    assert_eq(r["state"]["policy"]["proposers"][CFO], "the CFO")
+    assert_eq(length(r["events"][0]["data"]["changes"]), 4)
+    let d be send(r["state"], CFO, {"type": "policy", "deny_payee": VENDOR, "deny_proposer": AGENT})
+    assert(not contains(d["state"]["policy"]["payees"], VENDOR))
+    assert(not contains(d["state"]["policy"]["proposers"], AGENT))
+    assert_eq(send(s, AGENT, {"type": "policy", "grant": "1"})["error"], "only the owner sets the policy")
+    assert(starts_with(send(s, CFO, {"type": "policy"})["error"], "policy: nothing to change"))
+    -- the owner proposing to itself is one event, not two
+    let own be send(deposit({"app_id": 1, "sender": CFO, "token": USDC, "value": "10", "value_hex": "0x0", "state": r["state"]})["state"], CFO, {"type": "propose", "payee": STRANGER, "amount": "5"})
+    assert_eq(length(own["events"]), 1)
+
+test "the owner withdraws as a pull-payment, never through the trigger"
+    let r be send(funded("1000"), CFO, {"type": "withdraw", "amount": "400"})
+    assert_eq(r["state"]["balance"], "600")
+    assert_eq(r["withdrawals"], [{"token": USDC, "to": CFO, "amount": "400"}])
+    assert(not contains(r, "app_events"))
+    assert_eq(send(funded("1000"), AGENT, {"type": "withdraw", "amount": "1"})["error"], "only the owner withdraws")
+    assert(starts_with(send(funded("1000"), CFO, {"type": "withdraw", "amount": "400", "to": TRIGGER})["error"], "invalid destination"))
+    assert(starts_with(send(funded("10"), CFO, {"type": "withdraw", "amount": "400"})["error"], "insufficient balance"))
+
+test "the audit report is the whole picture; the ledger can be filtered by status"
+    let s be send(send(funded("1000"), AGENT, {"type": "propose", "payee": VENDOR, "amount": "150"})["state"], AGENT, {"type": "propose", "payee": STRANGER, "amount": "1"})["state"]
+    let audit be deanonymize({"app_id": 1, "sender": CFO, "request_type": 2, "kind": "deanonymize", "payload": {}, "payload_hex": nothing, "state": s})
+    assert_eq(audit["report"]["balance"], "850")
+    assert_eq(length(audit["report"]["proposals"]), 2)
+    assert_eq(audit["report"]["policy"]["allowance"], "350")
+    let open be deanonymize({"app_id": 1, "sender": CFO, "request_type": 2, "kind": "deanonymize", "payload": {"report_type": "ledger", "status": "pending"}, "payload_hex": nothing, "state": s})
+    assert_eq(length(open["report"]["proposals"]), 1)
+    assert_eq(open["report"]["proposals"][0]["payee"], STRANGER)
+    assert(starts_with(deanonymize({"app_id": 1, "sender": CFO, "request_type": 2, "kind": "deanonymize", "payload": {"report_type": "x"}, "payload_hex": nothing, "state": s})["error"], "unsupported report type"))
+
+test "an unknown instruction is an error, never a silent no-op"
+    assert(starts_with(send(treasury(), CFO, {"type": "mint"})["error"], "unsupported instruction type"))
+    assert(starts_with(send(treasury(), CFO, {"amount": "1"})["error"], "payload needs a"))

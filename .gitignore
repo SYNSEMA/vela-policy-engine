@@ -1,0 +1,25 @@
+# the engine clone scripts/build.sh makes, and its target dir
+.synsema/
+# Horizen's starter kit clone scripts/devnet.sh makes
+.vela-devnet/
+# built modules
+build/
+# keys, addresses and tokens: every client/.env* except the example
+client/.env*
+!client/.env.example
+# the agent's .env at the root, except the example
+/.env*
+!/.env.example
+# invoices: real ones stay local; the folders exist through .gitkeep
+inbox/*
+inbox-done/*
+inbox-review/*
+!inbox/.gitkeep
+!inbox-done/.gitkeep
+!inbox-review/.gitkeep
+# the trigger contract's build (Vela's BSL contracts are cloned, not vendored)
+scripts/trigger/lib/vela/
+scripts/trigger/out/
+scripts/trigger/cache/
+scripts/trigger/deploy.log
+scripts/trigger/trigger.address

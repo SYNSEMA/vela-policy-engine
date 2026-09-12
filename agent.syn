@@ -1,0 +1,135 @@
+-- agent.syn — the treasury's agent: the side OUTSIDE the enclave. It turns the invoices dropped
+-- in inbox/ into payment proposals and sends them to the app with its own key; the enclave's
+-- policy decides — pays at once, holds for the owner, or refuses. The agent holds no funds and
+-- has no say beyond proposing: the worst a bug (or a prompt injection) can do is a proposal the
+-- policy stops. That is the whole point: LLM outside, policy inside, the same language on both sides.
+--
+-- An invoice is a file in inbox/:
+--   *.json  {"payee": "0x…", "amount": "150.00", "memo": "INV-1001"}   — proposed as is, no LLM involved
+--   anything else (an email, a PDF's text, a message) — read by the LLM when a provider is configured
+--   (SYNSEMA_LLM_PROVIDER + its key in .env); without one it goes to inbox-review/ for a person.
+-- Handled files move to inbox-done/ (proposed) or inbox-review/ (could not be proposed; the log says why).
+--
+-- Run it from the repository root (the inbox folders and .env live there):
+--   synsema run agent.syn              -- watches inbox/ (AGENT_INTERVAL seconds between looks, default 30)
+--   synsema run agent.syn -- --once    -- one pass over inbox/, then exits (what scripts/e2e.sh does)
+-- On the Synsema platform this file is the recipe's entry (kind = worker); inbox/ is its volume.
+intent: "treasury agent: turns the invoices in inbox/ into payment proposals for the enclave; the policy inside decides"
+
+require net("localhost")
+require net("127.0.0.1")
+require net("devnet.synsema.app")
+require env("VELA_*")
+require env("AGENT_*")
+require env("SYNSEMA_LLM_PROVIDER")
+require secret("VELA_*")
+require sign("VELA_SECP_KEY")
+require random
+require time
+require file("inbox")
+require file("inbox/*")
+require file("inbox-done/*")
+require file("inbox-review/*")
+require llm
+
+use "./client/vela_lib.syn" as v
+
+let ETH be "0x0000000000000000000000000000000000000000"
+let PROCESS be 1
+task has(list, x)
+    each item in list
+        when item == x
+            give true
+    give false
+
+-- top-level statements run in order: the tasks they call must already be defined
+let ONCE be has(args(), "--once")
+let INTERVAL be number(env("AGENT_INTERVAL", "30"))
+
+task say(msg)
+    print("[agent] " + msg)
+    flush()
+
+task is_address(a)
+    give a != nothing and starts_with(lower(text(a)), "0x") and length(text(a)) == 42 and matches(slice(text(a), 2, 42), "[0-9a-fA-F]+")
+
+-- {"payee", "amount", "memo"} from a map, or nothing when it is not an invoice.
+task invoice_of(m, name)
+    when m == nothing or not is_address(field(m, "payee")) or field(m, "amount") == nothing
+        give nothing
+    let memo be text(field(m, "memo"))
+    give {"payee": lower(m["payee"]), "amount": trim(text(m["amount"])), "memo": when memo == "" then name otherwise memo}
+
+task field(m, key)
+    when contains(m, key)
+        give m[key]
+    give nothing
+
+-- A free-text invoice through the LLM: it only extracts three fields; every decision stays in the
+-- enclave. Offline (no provider) the operations return placeholders, never an invoice.
+task extract(content, name)
+    when env("SYNSEMA_LLM_PROVIDER", "") == ""
+        say(name + ": not JSON and no LLM provider configured (SYNSEMA_LLM_PROVIDER) — left for a person")
+        give nothing
+    let answer be generate "exactly one JSON object with the keys payee (the 0x address to pay), amount (the amount as a decimal number in a string, in tokens) and memo (the invoice number or a short description, at most 60 characters), and nothing else" given content
+    let raw be trim(text(answer))
+    when starts_with(raw, "```")
+        set raw to trim(replace_text(replace_text(raw, "```json", ""), "```", ""))
+    try
+        let inv be invoice_of(json_decode(raw), name)
+        when inv == nothing
+            say(name + ": the model's answer had no payee/amount — left for a person")
+        give inv
+    recover err
+        say(name + ": the model's answer was not JSON — left for a person")
+        give nothing
+
+task parse_invoice(name, content)
+    when ends_with(lower(name), ".json")
+        try
+            give invoice_of(json_decode(content), name)
+        recover err
+            say(name + ": invalid JSON (" + text(err) + ")")
+            give nothing
+    give extract(content, name)
+
+task propose(c, inv)
+    let plain be {"type": "propose", "payee": inv["payee"], "amount": v.to_units(inv["amount"], v.token_decimals(c)), "memo": inv["memo"]}
+    let payload be v.seal(v.derive_key(v.p521_key(), v.tee_public_key(c)), bytes(json_encode(plain)))
+    let id be v.submit(c, PROCESS, payload, ETH, 0)
+    v.wait_completed(c, id, false)
+    give id
+
+task move(name, content, folder)
+    write_file(folder + "/" + name, content)
+    delete_file("inbox/" + name)
+
+task tick(c)
+    each entry in list_dir("inbox")
+        when not entry["is_dir"] and not starts_with(entry["name"], ".")
+            let name be entry["name"]
+            let content be read_file("inbox/" + name)
+            try
+                let inv be parse_invoice(name, content)
+                when inv == nothing
+                    move(name, content, "inbox-review")
+                otherwise
+                    let id be propose(c, inv)
+                    say(name + ": proposed " + inv["amount"] + " to " + inv["payee"] + " (" + inv["memo"] + ") — request " + id)
+                    move(name, content, "inbox-done")
+            recover err
+                say(name + ": " + text(err) + " — left for a person")
+                move(name, content, "inbox-review")
+    -- the enclave's answers to this agent's proposals, decrypted
+    each item in v.my_events(c, 3)
+        when contains(item, "event") and contains(item["event"], "type") and item["event"]["type"] == "proposal"
+            say("proposal " + text(item["event"]["n"]) + " is " + item["event"]["status"] + (when length(item["event"]["reasons"]) == 0 then "" otherwise ": " + join(item["event"]["reasons"], "; ")))
+
+let c be v.cfg()
+say("treasury app " + v.need(c, "app_id", "VELA_APP_ID") + ", proposing as " + v.me() + (when ONCE then " (one pass)" otherwise ", watching inbox/ every " + text(INTERVAL) + "s"))
+tick(c)
+when not ONCE
+    let w be watch("inbox", {"interval": 1, "recursive": false})
+    while true
+        let ev be select({"files": w}, INTERVAL)
+        tick(c)

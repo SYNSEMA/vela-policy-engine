@@ -1,0 +1,376 @@
+-- vela_client.syn — the treasury's client, on top of vela_lib.syn (the protocol as a module).
+-- One program, three hats:
+--   the owner (CFO): funds, sets the policy, approves or rejects what the policy held, withdraws, audits;
+--   a proposer (the agent, or a person): proposes payments;
+--   anyone: claims, balances.
+-- Which hat is VELA_SECP_KEY in .env (the owner's in client/.env, or the agent's in the root .env).
+--
+-- Configuration: .env next to this file (copy .env.example). Amounts are in TOKENS (1500.50) and
+-- become units by text with the token's decimals(); "units" and "tokens" convert by hand.
+--
+--   the treasury (owner):
+--   synsema run vela_client.syn -- deploy-treasury <wasm> <max-auto tokens> [allowance tokens]   deploys with VELA_TOKEN and VELA_TRIGGER; prints the app id
+--   synsema run vela_client.syn -- fund <tokens>                       approve + deposit into the treasury
+--   synsema run vela_client.syn -- grant <tokens>                      adds to the agent's allowance (a "daily budget" is a grant a day)
+--   synsema run vela_client.syn -- set-max <tokens>                    the automatic limit per payment (above it: approval)
+--   synsema run vela_client.syn -- set-allowance <tokens>              sets the allowance outright
+--   synsema run vela_client.syn -- allow-payee <address> [label] [cap tokens] | deny-payee <address>
+--   synsema run vela_client.syn -- allow-proposer <address> [label] | deny-proposer <address>
+--   synsema run vela_client.syn -- approve <n|id> | reject <n|id> [reason]   what the policy held (n = the proposal number)
+--   synsema run vela_client.syn -- proposals [n]                       the owner's events: approval_needed, payment, settled, failed, rejected, policy
+--   synsema run vela_client.syn -- withdraw <tokens> [to]              the owner takes funds out (a pull-payment; claim-for)
+--   synsema run vela_client.syn -- audit ['<json>']                    the report (the caller must be an allowed authority): audit | ledger | policy
+--   a proposer:
+--   synsema run vela_client.syn -- propose <payee> <tokens> [memo]     a payment proposal; the enclave answers at once
+--   synsema run vela_client.syn -- outcomes [n]                        the proposer's events: pending | executing | settled | failed | rejected
+--   anyone:
+--   synsema run vela_client.syn -- pending <address> | claim-for <address> | token-balance <address>
+--   synsema run vela_client.syn -- units <tokens> | tokens <units>     convert by the token's decimals
+--
+--   Vela, generic (the starter kit's commands):
+--   synsema run vela_client.syn -- keys | address | tee | user-keys | user
+--   synsema run vela_client.syn -- deploy <wasm> [params-json|-] [trigger] | register | deposit <amount> [token]
+--   synsema run vela_client.syn -- send '<json>' [wei] | report '<json>' | report-download <id> | events [n] | app-events [n] | status <id>
+--   synsema run vela_client.syn -- register-for | send-for '<json>' [amount token] | events-for [n]   (the facilitator: VELA_USER_KEY signs, VELA_SECP_KEY pays)
+intent: "vela client: the treasury's owner, its proposers and anyone else — on top of the protocol module"
+
+require net("localhost")
+require net("127.0.0.1")
+require net("devnet.synsema.app")
+require env("VELA_*")
+require secret("VELA_*")
+require sign("VELA_SECP_KEY")
+require sign("VELA_USER_KEY")
+require random
+require time
+require file.read("*")
+require reveal("ecdh_keypair.private")
+
+use "./vela_lib.syn" as v
+
+let ETH be "0x0000000000000000000000000000000000000000"
+let PROCESS be 1
+let DEANONYMIZATION be 2
+let ASSOCIATE_KEY be 3
+let OWNER_EVENTS be ["approval_needed", "payment", "settled", "failed", "rejected", "policy", "deposit", "withdrawal"]
+
+task usage()
+    print("usage: synsema run vela_client.syn -- deploy-treasury <wasm> <max-auto> [allowance] | fund <tokens> | grant <tokens> | set-max <tokens> | set-allowance <tokens> | allow-payee <address> [label] [cap] | deny-payee <address> | allow-proposer <address> [label] | deny-proposer <address> | approve <n|id> | reject <n|id> [reason] | proposals [n] | withdraw <tokens> [to] | audit ['<json>'] | propose <payee> <tokens> [memo] | outcomes [n] | pending <address> | claim-for <address> | token-balance <address> | units <tokens> | tokens <units> | keys | address | tee | user-keys | user | deploy <wasm> [params-json|-] [trigger] | register | deposit <amount> [token] | send '<json>' [wei] | report '<json>' | report-download <id> | events [n] | app-events [n] | status <id> | register-for | send-for '<json>' [amount token] | events-for [n]")
+
+task arg_or(a, i, default)
+    give when length(a) > i then a[i] otherwise default
+
+task has(list, x)
+    each item in list
+        when item == x
+            give true
+    give false
+
+task units(c, tokens)
+    give v.to_units(tokens, v.token_decimals(c))
+
+task human(c, u)
+    give v.from_units(u, v.token_decimals(c))
+
+-- A proposal is named by its number (1, 2, …) or by its bytes16 id (0x…01).
+task proposal_id(t)
+    when starts_with(lower(t), "0x")
+        give lower(t)
+    give v.hex_of(int_to_bytes(v.int_of(t), 16))
+
+task encrypted(c, plain)
+    give v.seal(v.derive_key(v.p521_key(), v.tee_public_key(c)), bytes(json_encode(plain)))
+
+-- One encrypted instruction to the app, waited for.
+task instruct(c, plain)
+    let id be v.submit(c, PROCESS, encrypted(c, plain), ETH, 0)
+    print(plain["type"] + " submitted: " + id)
+    let row be v.wait_completed(c, id, false)
+    print("completed at block " + text(row["blockNumber"]) + ", fees " + text(row["applicationFees"]) + " wei")
+    give row
+
+-- The enclave speaks in units; people read tokens: amounts, balances, allowances and the numbers
+-- inside the reasons come out converted with the token's decimals.
+task in_tokens(msg, d)
+    let out be msg
+    each m in unique(find_all(msg, "[0-9]+"))
+        set out to replace_text(out, m, v.from_units(m, d))
+    give out
+
+task in_tokens_all(items, d)
+    let out be []
+    each item in items
+        set out to append(out, in_tokens(item, d))
+    give out
+
+task humanize(ev, d)
+    each key in ["amount", "balance", "allowance", "max_auto"]
+        when contains(ev, key) and ev[key] != nothing and matches(text(ev[key]), "[0-9]+")
+            set ev[key] to v.from_units(ev[key], d)
+    when contains(ev, "reasons")
+        set ev["reasons"] to in_tokens_all(ev["reasons"], d)
+    when contains(ev, "changes")
+        set ev["changes"] to in_tokens_all(ev["changes"], d)
+    when contains(ev, "proposal") and ev["proposal"] != nothing
+        let p be ev["proposal"]
+        set p["amount"] to v.from_units(p["amount"], d)
+        set p["reasons"] to in_tokens_all(p["reasons"], d)
+        set ev["proposal"] to p
+    give ev
+
+task print_events(c, items, types)
+    let d be v.token_decimals(c)
+    each item in items
+        when contains(item, "event") and contains(item["event"], "type") and (types == nothing or has(types, item["event"]["type"]))
+            print(json_encode(humanize(item["event"], d)))
+
+task run_cli(a)
+    when length(a) == 0
+        usage()
+        give nothing
+    let c be v.cfg()
+    match a[0]
+        -- ---- the treasury: the owner ----
+        is "deploy-treasury"
+            let params be {"owner": v.me(), "token": v.app_token(c), "triggerContract": lower(v.need(c, "trigger", "VELA_TRIGGER")), "max_auto": units(c, a[2]), "allowance": units(c, arg_or(a, 3, "0"))}
+            let ids be v.deploy(c, a[1], params, params["triggerContract"])
+            print("deploy submitted: app " + text(ids["app_id"]) + ", request " + ids["request_id"])
+            let row be v.wait_completed(c, ids["request_id"], true)
+            print("deploy completed at block " + text(row["blockNumber"]) + " — put VELA_APP_ID=" + text(ids["app_id"]) + " in .env (owner " + params["owner"] + ", trigger " + params["triggerContract"] + ")")
+        is "fund"
+            let u be v.int_of(units(c, a[1]))
+            let token be v.app_token(c)
+            v.approve(c, token, u)
+            let id be v.submit(c, PROCESS, bytes(""), token, u)
+            print("funding submitted: " + id)
+            v.wait_completed(c, id, false)
+            print("funded " + a[1] + " (" + text(u) + " units of " + token + ")")
+        is "grant"
+            instruct(c, {"type": "policy", "grant": units(c, a[1])})
+        is "set-max"
+            instruct(c, {"type": "policy", "max_auto": units(c, a[1])})
+        is "set-allowance"
+            instruct(c, {"type": "policy", "allowance": units(c, a[1])})
+        is "allow-payee"
+            let entry be {"address": lower(a[1]), "label": arg_or(a, 2, "")}
+            when length(a) > 3
+                set entry["cap"] to units(c, a[3])
+            instruct(c, {"type": "policy", "allow_payee": entry})
+        is "deny-payee"
+            instruct(c, {"type": "policy", "deny_payee": lower(a[1])})
+        is "allow-proposer"
+            instruct(c, {"type": "policy", "allow_proposer": {"address": lower(a[1]), "label": arg_or(a, 2, "")}})
+        is "deny-proposer"
+            instruct(c, {"type": "policy", "deny_proposer": lower(a[1])})
+        is "approve"
+            instruct(c, {"type": "approve", "id": proposal_id(a[1])})
+        is "reject"
+            instruct(c, {"type": "reject", "id": proposal_id(a[1]), "reason": arg_or(a, 2, "")})
+        is "proposals"
+            print_events(c, v.my_events(c, floor(number(arg_or(a, 1, "10")))), OWNER_EVENTS)
+        is "withdraw"
+            let plain be {"type": "withdraw", "amount": units(c, a[1])}
+            when length(a) > 2
+                set plain["to"] to lower(a[2])
+            instruct(c, plain)
+            print("withdrawn " + a[1] + " to a pull-payment; claim it with `claim-for <address>`")
+        is "audit"
+            let plain be json_decode(arg_or(a, 1, "{\"report_type\":\"audit\"}"))
+            let id be v.submit(c, DEANONYMIZATION, encrypted(c, plain), ETH, 0)
+            print("audit request submitted: " + id)
+            v.wait_completed(c, id, false)
+            print(json_encode(v.download_report(c, id)))
+        -- ---- a proposer ----
+        is "propose"
+            instruct(c, {"type": "propose", "payee": lower(a[1]), "amount": units(c, a[2]), "memo": arg_or(a, 3, "")})
+            print_events(c, v.my_events(c, 1), ["proposal", "payment", "approval_needed"])
+        is "outcomes"
+            print_events(c, v.my_events(c, floor(number(arg_or(a, 1, "10")))), ["proposal"])
+        -- ---- anyone ----
+        is "pending"
+            print(human(c, v.pending_claim(c, a[1])))
+        is "claim-for"
+            let receipt be v.send_tx(c, v.need(c, "processor", "VELA_PROCESSOR"), 0, abi_encode("claim(address,address)", [v.app_token(c), a[1]]))
+            print("claimed for " + a[1] + " (tx " + text(receipt["transactionHash"]) + "); balance " + human(c, v.token_balance(c, a[1])))
+        is "token-balance"
+            print(human(c, v.token_balance(c, a[1])))
+        is "units"
+            print(units(c, a[1]))
+        is "tokens"
+            print(human(c, a[1]))
+        -- ---- Vela, generic ----
+        is "keys"
+            let kp be ecdh_keypair("P-521")
+            print("VELA_P521_KEY=" + decode(reveal(kp["private"]), "hex"))
+            print("VELA_P521_PUB=" + decode(kp["public"], "hex"))
+        is "address"
+            print(v.me())
+        is "tee"
+            print(v.hex_of(v.tee_public_key(c)))
+        is "user"
+            print(v.user_address())
+        is "user-keys"
+            let k be decode(random_bytes(32), "hex")
+            print("VELA_USER_KEY=" + k)
+            print("address " + eth_address(as_secret(k, "VELA_USER_KEY")))
+        is "deploy"
+            let params be when length(a) > 2 and a[2] != "-" then json_decode(a[2]) otherwise nothing
+            let trigger be arg_or(a, 3, nothing)
+            let ids be v.deploy(c, a[1], params, trigger)
+            print("deploy submitted: app " + text(ids["app_id"]) + ", request " + ids["request_id"])
+            let row be v.wait_completed(c, ids["request_id"], true)
+            print("deploy completed at block " + text(row["blockNumber"]) + " — put VELA_APP_ID=" + text(ids["app_id"]) + " in .env")
+        is "register"
+            let id be v.submit(c, ASSOCIATE_KEY, v.register_payload(c), ETH, 0)
+            print("register submitted: " + id)
+            v.wait_completed(c, id, false)
+            print("registered " + v.me() + " with a privacy seed (50 subtypes)")
+        is "deposit"
+            let token be lower(arg_or(a, 2, ETH))
+            let amount be v.int_of(a[1])
+            when token != ETH
+                v.approve(c, token, amount)
+            let id be v.submit(c, PROCESS, bytes(""), token, amount)
+            print("deposit submitted: " + id)
+            v.wait_completed(c, id, false)
+            print("deposit completed" + (when token == ETH then "" otherwise " (" + token + ")"))
+        is "send"
+            let plain be json_decode(a[1])
+            let wei be when length(a) > 2 then v.int_of(a[2]) otherwise 0
+            let id be v.submit(c, PROCESS, encrypted(c, plain), ETH, wei)
+            print("request submitted: " + id)
+            let row be v.wait_completed(c, id, false)
+            print("completed at block " + text(row["blockNumber"]) + ", fees " + text(row["applicationFees"]) + " wei")
+        is "report"
+            let plain be json_decode(arg_or(a, 1, "{}"))
+            let id be v.submit(c, DEANONYMIZATION, encrypted(c, plain), ETH, 0)
+            print("report request submitted: " + id)
+            v.wait_completed(c, id, false)
+            print("report generated: " + v.need(c, "app_id", "VELA_APP_ID") + "_" + slice(id, 2, length(id)))
+            print(json_encode(v.download_report(c, id)))
+        is "report-download"
+            print(json_encode(v.download_report(c, a[1])))
+        is "events"
+            each item in v.my_events(c, floor(number(arg_or(a, 1, "10"))))
+                print(json_encode(item))
+        is "app-events"
+            each item in v.app_events(c, floor(number(arg_or(a, 1, "10"))))
+                print(json_encode(item))
+        is "status"
+            let row be v.completion(c, lower(a[1]), false)
+            when row == nothing
+                set row to v.completion(c, lower(a[1]), true)
+            print(when row == nothing then "pending (not completed yet)" otherwise json_encode(row))
+        is "register-for"
+            let id be v.submit_for(c, ASSOCIATE_KEY, v.register_payload_for(c), ETH, 0)
+            print("register submitted by the facilitator: " + id)
+            v.wait_completed(c, id, false)
+            print("registered " + v.user_address() + " (the user paid nothing)")
+        is "send-for"
+            let plain be json_decode(a[1])
+            let amount be when length(a) > 2 then v.int_of(a[2]) otherwise 0
+            let token be lower(arg_or(a, 3, ETH))
+            let id be v.submit_for(c, PROCESS, encrypted(c, plain), token, amount)
+            print("request submitted by the facilitator for " + v.user_address() + ": " + id)
+            let row be v.wait_completed(c, id, false)
+            print("completed at block " + text(row["blockNumber"]) + ", fees " + text(row["applicationFees"]) + " wei (paid by the facilitator)")
+        is "events-for"
+            each item in v.events_for(c, floor(number(arg_or(a, 1, "10"))))
+                print(json_encode(item))
+        otherwise
+            usage()
+
+run_cli(args())
+
+-- ---------------------------------------------------------------------------------------
+-- Tests (pure: no chain, no network): `synsema test vela_client.syn`
+-- ---------------------------------------------------------------------------------------
+
+test "decimal text becomes an exact integer beyond 2^53"
+    assert_eq(text(v.int_of("9105241052143571847")), "9105241052143571847")
+    assert_eq(v.int_of("100"), 100)
+    assert_eq(v.int_of("0"), 0)
+
+test "a payload round-trips through the Executor's cipher (P-521 ECDH → HKDF → AES-256-GCM)"
+    let user be ecdh_keypair("P-521")
+    let tee be ecdh_keypair("P-521")
+    let k_user be v.derive_key(user["private"], tee["public"])
+    let k_tee be v.derive_key(tee["private"], user["public"])
+    let blob be v.seal(k_user, bytes("{\"type\":\"transfer\"}"))
+    assert_eq(length(blob), 12 + 19 + 16)
+    assert_eq(decode(v.open(k_tee, blob)), "{\"type\":\"transfer\"}")
+    assert_error(() => v.open(k_tee, slice(blob, 0, 27)))
+
+test "the seed is a 65-byte signature and yields 50 distinct 32-byte subtypes"
+    let k be as_secret("ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80", "VELA_SECP_KEY")
+    let s be v.seed_of(k)
+    assert_eq(length(s), 65)
+    assert_eq(s, v.seed_of(k))
+    let subs be v.subtypes(s)
+    assert_eq(length(subs), 50)
+    assert_eq(length(subs[0]), 66)
+    assert_eq(length(unique(subs)), 50)
+
+test "request and deploy ids come out of the receipt logs"
+    let sig_request be "0x" + decode(keccak256("RequestSubmitted(uint64,bytes32,address,address)"), "hex")
+    let sig_deploy be "0x" + decode(keccak256("DeployRequestSubmitted(uint64,bytes32,address)"), "hex")
+    let req be "0x" + decode(bytes([171]) + int_to_bytes(0, 31), "hex")
+    let receipt be {"logs": [{"topics": ["0xdead"], "data": bytes([])}, {"topics": [sig_request, "0x" + decode(int_to_bytes(7, 32), "hex"), req, "0x" + decode(int_to_bytes(0, 32), "hex")], "data": bytes([])}]}
+    assert_eq(v.request_id_of(receipt), req)
+    let dep be {"logs": [{"topics": [sig_deploy, "0x" + decode(int_to_bytes(9105241052143571847, 32), "hex"), "0x" + decode(int_to_bytes(0, 32), "hex")], "data": bytes([205]) + int_to_bytes(0, 31)}]}
+    let ids be v.deploy_ids_of(dep)
+    assert_eq(text(ids["app_id"]), "9105241052143571847")
+    assert_eq(slice(ids["request_id"], 0, 4), "0xcd")
+    assert_error(() => v.request_id_of({"logs": []}))
+
+test "a subtype reads back as its label when it is one, and as nothing when it is a hash"
+    let label be "payment"
+    let padded be bytes(label) + int_to_bytes(0, 32 - length(bytes(label)))
+    assert_eq(v.subtype_label(v.hex_of(padded)), label)
+    assert_eq(v.subtype_label(v.hex_of(keccak256("INV-1"))), nothing)
+    assert_eq(v.subtype_label(v.hex_of(int_to_bytes(0, 32))), nothing)
+
+test "the facilitator's typed data digests are 32 bytes and change with every field that matters"
+    let processor be "0xDc64a140Aa3E981100a9becA4E685f962f0cF6C9"
+    let user be "0x1111111111111111111111111111111111111111"
+    let d1 be v.authorization_digest(31337, processor, user, 7, PROCESS, bytes("payload"), ETH, 0, 0, 1800000000)
+    let d2 be v.authorization_digest(31337, processor, user, 7, PROCESS, bytes("payload"), ETH, 0, 1, 1800000000)
+    let d3 be v.authorization_digest(1, processor, user, 7, PROCESS, bytes("payload"), ETH, 0, 0, 1800000000)
+    assert_eq(length(d1), 32)
+    assert(d1 != d2)
+    assert(d1 != d3)
+    assert_eq(d1, v.authorization_digest(31337, processor, user, 7, PROCESS, bytes("payload"), ETH, 0, 0, 1800000000))
+    let p1 be v.permit_digest(31337, processor, "Test Token", user, processor, 1000000, 0, 1800000000)
+    assert_eq(length(p1), 32)
+    assert(p1 != v.permit_digest(31337, processor, "Test Token", user, processor, 1000000, 1, 1800000000))
+    let k be as_secret("ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80", "VELA_USER_KEY")
+    let sig be v.eth_signature(d1, k)
+    assert_eq(length(sig), 65)
+    assert(sig[64] == 27 or sig[64] == 28)
+    assert_eq(length(v.permit_bytes(sig)), 96)
+    assert_eq(v.permit_bytes(sig)[31], sig[64])
+
+test "submitRequest calldata carries the selector"
+    let data be abi_encode("submitRequest(uint8,uint64,uint8,bytes,address,uint256,uint256)", [0, 1, PROCESS, bytes("x"), ETH, 5, 100])
+    assert_eq(slice(data, 0, 4), abi_selector("submitRequest(uint8,uint64,uint8,bytes,address,uint256,uint256)"))
+
+test "human amounts become exact token units and back; a proposal is named by number or id"
+    assert_eq(v.to_units("1500.50", 6), "1500500000")
+    assert_eq(v.to_units("0.000001", 6), "1")
+    assert_eq(v.to_units("007.5", 2), "750")
+    assert_eq(v.to_units("123456789012345678.123456", 6), "123456789012345678123456")
+    assert_error(() => v.to_units("1.2345678", 6))
+    assert_error(() => v.to_units("abc", 6))
+    assert_eq(v.from_units("1500500000", 6), "1500.500000")
+    assert_eq(v.from_units("42", 0), "42")
+    assert_eq(proposal_id("1"), "0x00000000000000000000000000000001")
+    assert_eq(proposal_id("0x000000000000000000000000000000FF"), "0x000000000000000000000000000000ff")
+
+test "units inside a reason come out as tokens"
+    assert_eq(in_tokens("over the automatic limit 200000000", 6), "over the automatic limit 200.000000")
+    assert_eq(in_tokens("treasury balance 1000 is short", 6), "treasury balance 0.001000 is short")
+    assert_eq(in_tokens("payee not allowlisted", 6), "payee not allowlisted")
+    let ev be humanize({"type": "payment", "balance": "580000000", "allowance": "330000000", "proposal": {"amount": "20000000", "reasons": ["over the payee's cap 300000000"]}}, 6)
+    assert_eq(ev["balance"], "580.000000")
+    assert_eq(ev["proposal"]["amount"], "20.000000")
+    assert_eq(ev["proposal"]["reasons"], ["over the payee's cap 300.000000"])

@@ -1,0 +1,33 @@
+# Agent treasury on Vela (Horizen) as a recipe: the policy lives in the enclave (app/app.syn, built
+# to build/app.wasm and deployed to Vela with its trigger contract); the entry is the agent worker
+# (agent.syn), the side outside the enclave: it turns invoices into proposals and the policy
+# decides. This file only says what the code cannot say about itself; the `require` blocks are the
+# manifests of capabilities. The owner's commands are client/vela_client.syn, run with the binary.
+
+name = "Agent treasury on Vela"
+slug = "vela-treasury"
+version = "0.1.0"
+kind = "worker"
+entry = "agent.syn"
+engine = "0.6"
+tagline = "An agent proposes payments, the enclave applies the owner's policy, a contract pays: LLM outside, policy inside, on Horizen's Vela."
+tagline_es = "Un agente propone pagos, el enclave aplica la política del dueño, un contrato paga: LLM afuera, política adentro, en Vela (Horizen)."
+tagline_pt = "Um agente propõe pagamentos, o enclave aplica a política do dono, um contrato paga: LLM fora, política dentro, no Vela (Horizen)."
+
+[secrets]
+VELA_SECP_KEY = "the agent's secp256k1 key: signs its proposals and pays their fees (hex; a little ETH, never the owner's key)"
+VELA_P521_KEY = "the agent's P-521 private key for the encrypted channel with the Executor (hex; `vela_client.syn -- keys` makes one)"
+
+[env]
+VELA_APP_ID = ""
+VELA_TOKEN = ""
+VELA_RPC_URL = "http://localhost:8545"
+VELA_AUTHORITY_URL = "http://localhost:8081"
+VELA_SUBGRAPH_URL = "http://localhost:8000/subgraphs/name/hcce"
+VELA_MAX_FEE = "100"
+AGENT_INTERVAL = "30"
+
+[volumes]
+inbox = "./inbox"
+done = "./inbox-done"
+review = "./inbox-review"
