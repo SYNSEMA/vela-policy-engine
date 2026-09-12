@@ -16,7 +16,7 @@ cd "$ROOT/client"
 [ -f .env ] || { echo "client/.env is missing: run scripts/devnet.sh, or copy .env.example and point it at a hosted devnet"; exit 2; }
 [ -f "$APP_WASM" ] || { echo "$APP_WASM is missing: run scripts/build.sh (or download the CI artifact)"; exit 2; }
 TOKEN="$(sed -n 's/^VELA_TOKEN=//p' .env | tr -d '\r')"
-[ -n "$TOKEN" ] || { echo "VELA_TOKEN is empty in client/.env: the treasury needs an allowlisted ERC-20 (scripts/devnet.sh deploys one locally; on a hosted devnet ask its operator)"; exit 2; }
+[ -n "$TOKEN" ] || { echo "VELA_TOKEN is empty in client/.env: the treasury needs an allowlisted ERC-20 (scripts/devnet.sh deploys one locally; on the public devnet copy VELA_TEST_TOKEN into VELA_TOKEN, or allow-token another)"; exit 2; }
 case "$(uname -s)" in MINGW*|MSYS*|CYGWIN*) APP_WASM="$(cygpath -w "$APP_WASM")" ;; esac
 
 run() { synsema run vela_client.syn -- "$@"; }
@@ -92,6 +92,6 @@ cd "$ROOT/client"
 wait_balance "$VENDOR" 420
 echo "== the agent's outcomes"; agent outcomes 4
 echo "== the owner's ledger (events)"; run proposals 6
-echo "== audit (needs DefaultAuthority.addAllowedAuthority(appId, owner) from the admin)"
-run audit || echo "   not an allowed authority yet: ask the devnet's operator, then run \`audit\`"
+echo "== allow-authority: the owner becomes an auditor of this app (the signing key is the admin on a devnet)"; run allow-authority "$APP_ID" "$OWNER"
+echo "== audit"; run audit
 echo "done: VELA_APP_ID=$APP_ID is in client/.env and .env (the agent's)"

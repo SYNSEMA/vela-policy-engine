@@ -28,6 +28,10 @@
 --   synsema run vela_client.syn -- units <tokens> | tokens <units>     convert by the token's decimals
 --
 --   Vela, generic (the starter kit's commands):
+--   the public devnet (no Docker):
+--   synsema run vela_client.syn -- devnet [host]                     a token of your own from devnet.synsema.app, written to .env
+--   synsema run vela_client.syn -- allow-token <address>             TokenAllowlist.addAllowedToken with the signing key (the admin: Anvil #0 on a devnet)
+--   synsema run vela_client.syn -- allow-authority <appId> <address> DefaultAuthority.addAllowedAuthority — an auditor for your app
 --   synsema run vela_client.syn -- keys | address | tee | user-keys | user
 --   synsema run vela_client.syn -- deploy <wasm> [params-json|-] [trigger] | register | deposit <amount> [token]
 --   synsema run vela_client.syn -- send '<json>' [wei] | report '<json>' | report-download <id> | events [n] | app-events [n] | status <id>
@@ -44,6 +48,7 @@ require sign("VELA_USER_KEY")
 require random
 require time
 require file.read("*")
+require file.write(".env")
 require reveal("ecdh_keypair.private")
 
 use "./vela_lib.syn" as v
@@ -55,7 +60,7 @@ let ASSOCIATE_KEY be 3
 let OWNER_EVENTS be ["approval_needed", "payment", "settled", "failed", "rejected", "policy", "deposit", "withdrawal"]
 
 task usage()
-    print("usage: synsema run vela_client.syn -- deploy-treasury <wasm> <max-auto> [allowance] | fund <tokens> | grant <tokens> | set-max <tokens> | set-allowance <tokens> | allow-payee <address> [label] [cap] | deny-payee <address> | allow-proposer <address> [label] | deny-proposer <address> | approve <n|id> | reject <n|id> [reason] | proposals [n] | withdraw <tokens> [to] | audit ['<json>'] | propose <payee> <tokens> [memo] | outcomes [n] | pending <address> | claim-for <address> | token-balance <address> | units <tokens> | tokens <units> | keys | address | tee | user-keys | user | deploy <wasm> [params-json|-] [trigger] | register | deposit <amount> [token] | send '<json>' [wei] | report '<json>' | report-download <id> | events [n] | app-events [n] | status <id> | register-for | send-for '<json>' [amount token] | events-for [n]")
+    print("usage: synsema run vela_client.syn -- devnet [host] | allow-token <address> | allow-authority <appId> <address> | deploy-treasury <wasm> <max-auto> [allowance] | fund <tokens> | grant <tokens> | set-max <tokens> | set-allowance <tokens> | allow-payee <address> [label] [cap] | deny-payee <address> | allow-proposer <address> [label] | deny-proposer <address> | approve <n|id> | reject <n|id> [reason] | proposals [n] | withdraw <tokens> [to] | audit ['<json>'] | propose <payee> <tokens> [memo] | outcomes [n] | pending <address> | claim-for <address> | token-balance <address> | units <tokens> | tokens <units> | keys | address | tee | user-keys | user | deploy <wasm> [params-json|-] [trigger] | register | deposit <amount> [token] | send '<json>' [wei] | report '<json>' | report-download <id> | events [n] | app-events [n] | status <id> | register-for | send-for '<json>' [amount token] | events-for [n]")
 
 task arg_or(a, i, default)
     give when length(a) > i then a[i] otherwise default
@@ -277,6 +282,19 @@ task run_cli(a)
         is "events-for"
             each item in v.events_for(c, floor(number(arg_or(a, 1, "10"))))
                 print(json_encode(item))
+        is "devnet"
+            let host be arg_or(a, 1, "devnet.synsema.app")
+            let values be v.devnet_env(host)
+            v.env_write(".env", values)
+            each k in keys(values)
+                print(k + "=" + text(values[k]))
+            print("written to .env: a token of your own on " + host + " (the admin key there is Anvil #0; allow-token / allow-authority are yours to run)")
+        is "allow-token"
+            let receipt be v.allow_token(c, lower(a[1]))
+            print("token " + lower(a[1]) + " allowlisted (tx " + text(receipt["transactionHash"]) + ")")
+        is "allow-authority"
+            let receipt be v.allow_authority(c, v.int_of(a[1]), lower(a[2]))
+            print("authority " + lower(a[2]) + " allowed for app " + a[1] + " (tx " + text(receipt["transactionHash"]) + ")")
         otherwise
             usage()
 

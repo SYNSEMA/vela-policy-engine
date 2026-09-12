@@ -21,7 +21,7 @@ owner — funds, grants, allowlists, approves, withdraws, audits
 Built on [Vela](https://docs.horizen.io/vela/introduction/), whose Executor runs the app inside a
 TEE and settles every result on-chain, and on the [vela-app](https://github.com/SYNSEMA/vela-app)
 starter kit. Verified end to end against Horizen's starter kit v0.2.0 (the real Executor, the real
-contracts) on the shared devnet, trigger cycle included.
+contracts) on the public devnet, trigger cycle included.
 
 ## What you get
 
@@ -32,7 +32,8 @@ client/vela_lib.syn          Vela's client protocol as a module (keys, cipher, s
 client/vela_client.syn       the owner's and the proposers' commands, on top of the module
 scripts/trigger/             TreasuryTrigger.sol, built against Vela's contracts and deployed by scripts/trigger/deploy.sh
 scripts/erc20/               the test stablecoin (TST, 6 decimals, permit) scripts/devnet.sh deploys and allowlists locally
-scripts/build.sh             app/app.syn → build/app.wasm (the guest module Vela loads) + sha256
+scripts/build.sh             app/app.syn → build/app.wasm (the release's guest module with your program in its slot) + sha256
+scripts/embed.syn            puts a .syn into the app slot of a guest module — what build.sh runs; no compiler
 scripts/smoke.mjs            probe of the module under Node's WASI, the way the Executor drives it
 scripts/devnet.sh            Horizen's starter kit in Docker + the test token + the trigger; client/.env written
 scripts/e2e.sh               the whole treasury: trigger → app → policy → paid · held+approved · held+rejected · from inbox/
@@ -60,14 +61,14 @@ reverted, refunds the treasury (and the allowance when the payment was automatic
 
 ## Ten minutes
 
-You need the [`synsema` binary](https://synsema.org) (`npm i -g synsema`, or the install script) and,
-to build the module, Rust (`rustup`) — or push to GitHub and download `app.wasm` from the CI run.
-For the stack you need Docker (also used to compile the trigger with `forge`, unless foundry is
-installed), or a hosted devnet's URLs and token.
+You need the [`synsema` binary](https://synsema.org) (`npm i -g synsema`, or the install script). That is
+all: the module is the release's guest with your program in its slot — no compiler, a few seconds.
+For the stack you need Docker, or a token of your own on the public devnet (`synsema run vela_client.syn -- devnet`);
+the trigger contract compiles with `forge` — foundry if you have it, the kit's Docker image otherwise.
 
 ```sh
 synsema test app/app.syn                 # 1. the policy, natively — the same code runs in the enclave
-sh scripts/build.sh                      # 2. build/app.wasm (first time ≈ 5 min: it compiles the interpreter)
+sh scripts/build.sh                      # 2. build/app.wasm: the release's guest + your program (the guest downloads once)
 node scripts/smoke.mjs build/app.wasm    #    Node 20 or 24+ (not 22)
 sh scripts/devnet.sh                     # 3. Vela in Docker + the test token + the trigger; writes client/.env
 sh scripts/e2e.sh                        # 4. the whole treasury, four proposals, balances checked on-chain
@@ -78,7 +79,7 @@ sh scripts/e2e.sh                        # 4. the whole treasury, four proposals
 default; `AGENT_KEY=<hex>` for another); funds 1000; allows the agent as proposer and Anvil #2 as
 payee with a cap of 300; grants 500. Then: a proposal of 150 paid at once (balance checked on-chain),
 250 held and approved, 10 to a stranger held and rejected, and an invoice dropped in `inbox/` that
-the worker proposes. About ten minutes on the shared devnet.
+the worker proposes. About ten minutes on the public devnet.
 
 ## The owner
 
@@ -149,7 +150,8 @@ held, approved or rejected, and the reasons.
 - The app is deployed for one owner, one token, one trigger; redeploying creates a new application
   id, a new ledger, and needs a new trigger.
 - Deploying needs `DEPLOYER_ROLE`; the token needs `TokenAllowlist.addAllowedToken`; the auditor
-  needs `DefaultAuthority.addAllowedAuthority(appId, address)` from the admin, per application.
+  needs `DefaultAuthority.addAllowedAuthority(appId, address)` from the admin, per application
+  (`vela_client.syn -- allow-authority <appId> <address>`; on a devnet the admin key is Anvil #0).
 - Amounts are the token's smallest unit as text inside the enclave; the client converts.
 - Node 22 crashes intermittently inside V8 running this module; use Node 20 or 24+.
 - On Windows, run the scripts from Git Bash.
