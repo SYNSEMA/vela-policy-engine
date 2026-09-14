@@ -1,0 +1,327 @@
+-- web.syn — the treasury console: the owner sets the policy, watches what the agent proposes,
+-- approves or rejects what the policy held, and sees every payment settle on-chain — from the
+-- browser. This is the recipe's entry on the Synsema platform (kind = web). The agent lives here
+-- too as a demo proposer with a key of its own (the standalone worker, agent.syn, does the same
+-- from an inbox); the enclave treats both alike: a proposer is a key the owner allowed.
+--
+-- What it keeps (data/treasury.json, on the project's volume): the app id and its trigger, the
+-- P-521 pair it made when none came from the environment, the agent's key, the payees it named.
+-- Every action is one request to the enclave: 30 to 60 seconds on a devnet; a payment also runs
+-- the trigger cycle (about a minute more) before it shows as settled.
+--
+--   synsema serve web.syn            (from the repository root; .env there = `vela_client.syn -- devnet`)
+intent: "treasury console: an agent proposes, the enclave applies the owner's policy, the owner approves — from the browser"
+
+require serve(8080)
+require net("localhost")
+require net("127.0.0.1")
+require net("devnet.synsema.app")
+require net("github.com")
+require net("objects.githubusercontent.com")
+require net("release-assets.githubusercontent.com")
+require env("VELA_*")
+require env("SYNSEMA_*")
+require secret("VELA_*")
+require sign("VELA_SECP_KEY")
+require sign("VELA_USER_KEY")
+require random
+require time
+require file("data")
+require file("data/*")
+require file.read("app/*")
+require file.read("pages/*")
+require reveal("ecdh_keypair.private")
+
+use "./client/vela_lib.syn" as v
+use "./scripts/embed_lib.syn" as slot
+
+let ETH be "0x0000000000000000000000000000000000000000"
+let PROCESS be 1
+let ASSOCIATE_KEY be 3
+let GUEST_TAG be env("SYNSEMA_GUEST_TAG", "v0.6.23")
+let STATE be "data/treasury.json"
+
+task load()
+    when file_exists(STATE)
+        give json_decode(read_file(STATE))
+    give {"app_id": "", "trigger": "", "p521_key": "", "p521_pub": "", "agent_key": "", "agent": "", "payees": []}
+
+task save(s)
+    write_file(STATE, json_encode(s))
+
+task config(s)
+    let c be v.cfg()
+    when c["app_id"] == "" and s["app_id"] != ""
+        set c["app_id"] to s["app_id"]
+    give c
+
+task p521_pair(s)
+    when env("VELA_P521_KEY", "") != ""
+        give {"key": v.p521_key(), "pub": v.p521_public()}
+    when s["p521_key"] == ""
+        let kp be ecdh_keypair("P-521")
+        set s["p521_key"] to decode(reveal(kp["private"]), "hex")
+        set s["p521_pub"] to decode(kp["public"], "hex")
+        save(s)
+    give {"key": v.p521_of(s["p521_key"]), "pub": v.hex_bytes(s["p521_pub"])}
+
+task owner()
+    give v.secp_key()
+
+task agent_key(s)
+    give v.secp_of(s["agent_key"], "VELA_USER_KEY")
+
+task field(m, key, default)
+    when m != nothing and contains(m, key) and m[key] != nothing and text(m[key]) != ""
+        give m[key]
+    give default
+
+task human(c, u)
+    give v.from_units(text(u), v.token_decimals(c))
+
+task units(c, tokens)
+    give v.to_units(tokens, v.token_decimals(c))
+
+task encrypted(c, keys, plain)
+    give v.seal(v.derive_key(keys["key"], v.tee_public_key(c)), bytes(json_encode(plain)))
+
+task qs(msg)
+    let m be replace_text(replace_text(replace_text(replace_text(replace_text(text(msg), "%", " pct"), "&", " and "), "#", " "), "?", " "), "+", " plus ")
+    give replace_text(trim(m), " ", "+")
+
+task back(ok, err)
+    when err != ""
+        give redirect("/?err=" + qs(err), 302)
+    give redirect("/?ok=" + qs(ok), 302)
+
+-- the enclave speaks in units; the pages in tokens, inside the reasons too (whole numbers only:
+-- the digits inside an address stay)
+task in_tokens(msg, d)
+    let out be msg
+    each m in unique(find_all(msg, "\b[0-9]+\b"))
+        set out to replace_text(out, m, v.from_units(m, d))
+    give out
+
+task in_tokens_all(items, d)
+    let out be []
+    each item in items
+        set out to append(out, in_tokens(item, d))
+    give out
+
+task humanize(ev, d)
+    each key in ["amount", "balance", "allowance", "max_auto"]
+        when contains(ev, key) and ev[key] != nothing and matches(text(ev[key]), "[0-9]+")
+            set ev[key] to v.from_units(ev[key], d)
+    when contains(ev, "reasons")
+        set ev["reasons"] to in_tokens_all(ev["reasons"], d)
+    when contains(ev, "changes")
+        set ev["changes"] to in_tokens_all(ev["changes"], d)
+    when contains(ev, "proposal") and ev["proposal"] != nothing
+        let p be ev["proposal"]
+        set p["amount"] to v.from_units(p["amount"], d)
+        set p["reasons"] to in_tokens_all(p["reasons"], d)
+        set ev["proposal"] to p
+    give ev
+
+-- ---- the actions ----
+
+-- one trigger per app, made by the factory (a Synsema program cannot send a creation transaction)
+task make_trigger(c)
+    let factory be lower(v.need(c, "trigger_factory", "VELA_TRIGGER_FACTORY"))
+    let receipt be v.send_tx(c, factory, 0, abi_encode("create()", []))
+    let sig be "0x" + decode(keccak256("Created(address,address)"), "hex")
+    each lg in receipt["logs"]
+        when length(lg["topics"]) >= 2 and lower(text(lg["topics"][0])) == sig
+            let t be lower(text(lg["topics"][1]))
+            give "0x" + slice(t, length(t) - 40, length(t))
+    raise("the factory answered without a Created event")
+
+task do_deploy(s, max_auto, allowance)
+    let c be config(s)
+    let keys be p521_pair(s)
+    when s["agent_key"] == ""
+        set s["agent_key"] to decode(random_bytes(32), "hex")
+        set s["agent"] to eth_address(agent_key(s))
+        save(s)
+    let guest be nothing
+    when file_exists("data/guest.wasm")
+        set guest to read_file_bytes("data/guest.wasm")
+    otherwise
+        set guest to slot.release_guest(GUEST_TAG)
+        write_file("data/guest.wasm", guest)
+    -- the trigger is kept as soon as it exists: a deploy that fails after it is retried with the same one
+    let trigger be s["trigger"]
+    when trigger == ""
+        set trigger to make_trigger(c)
+        set s["trigger"] to trigger
+        save(s)
+    let wasm be slot.embed(guest, read_file("app/app.syn"), "app.syn")
+    let params be {"owner": v.me(), "token": v.app_token(c), "triggerContract": trigger, "max_auto": units(c, max_auto), "allowance": units(c, allowance), "proposers": {}}
+    set params["proposers"][s["agent"]] to "the agent"
+    let ids be v.deploy_bytes(c, wasm, params, trigger)
+    v.wait_completed(c, ids["request_id"], true)
+    set s["app_id"] to text(ids["app_id"])
+    set s["trigger"] to trigger
+    save(s)
+    set c["app_id"] to s["app_id"]
+    let id be v.submit(c, ASSOCIATE_KEY, v.register_payload_with(c, keys["key"], keys["pub"], owner()), ETH, 0)
+    v.wait_completed(c, id, false)
+    let id2 be v.submit_for_with(c, agent_key(s), ASSOCIATE_KEY, v.register_payload_with(c, keys["key"], keys["pub"], agent_key(s)), ETH, 0)
+    v.wait_completed(c, id2, false)
+    give "deployed as app " + s["app_id"] + " with trigger " + trigger + "; the owner and the agent are registered"
+
+task do_fund(s, amount)
+    let c be config(s)
+    let u be v.int_of(units(c, amount))
+    let token be v.app_token(c)
+    v.approve(c, token, u)
+    let id be v.submit(c, PROCESS, bytes(""), token, u)
+    v.wait_completed(c, id, false)
+    give "funded " + amount
+
+task instruct(s, plain)
+    let c be config(s)
+    let id be v.submit(c, PROCESS, encrypted(c, p521_pair(s), plain), ETH, 0)
+    v.wait_completed(c, id, false)
+    give id
+
+task do_policy(s, f)
+    let c be config(s)
+    let plain be {"type": "policy"}
+    when field(f, "max_auto", "") != ""
+        set plain["max_auto"] to units(c, text(f["max_auto"]))
+    when field(f, "grant", "") != ""
+        set plain["grant"] to units(c, text(f["grant"]))
+    instruct(s, plain)
+    give "policy updated"
+
+task do_payee(s, f)
+    let c be config(s)
+    let address be lower(trim(text(field(f, "address", ""))))
+    when length(address) != 42
+        raise("give the payee's address")
+    let entry be {"address": address, "label": trim(text(field(f, "label", "")))}
+    when field(f, "cap", "") != ""
+        set entry["cap"] to units(c, text(f["cap"]))
+    instruct(s, {"type": "policy", "allow_payee": entry})
+    let known be false
+    each p in s["payees"]
+        when p["address"] == address
+            set known to true
+    when not known
+        set s["payees"] to append(s["payees"], {"address": address, "label": entry["label"]})
+        save(s)
+    give "payee " + address + " allowed"
+
+-- the agent proposes: its own key signs, the owner's facilitator submits
+task do_propose(s, f)
+    let c be config(s)
+    let plain be {"type": "propose", "payee": lower(trim(text(field(f, "payee", "")))), "amount": units(c, text(field(f, "amount", "0"))), "memo": text(field(f, "memo", ""))}
+    let id be v.submit_for_with(c, agent_key(s), PROCESS, encrypted(c, p521_pair(s), plain), ETH, 0)
+    v.wait_completed(c, id, false)
+    give "the agent proposed " + text(field(f, "amount", "")) + " to " + plain["payee"]
+
+task do_decide(s, kind, n, why)
+    let id be "0x" + decode(int_to_bytes(v.int_of(n), 16), "hex")
+    let plain be {"type": kind, "id": id}
+    when why != ""
+        set plain["reason"] to why
+    instruct(s, plain)
+    give "proposal " + n + " " + (when kind == "approve" then "approved: paying through the trigger" otherwise "rejected")
+
+-- ---- the page ----
+
+task overview(s, ok, err)
+    let c be config(s)
+    let d be {"ok": ok, "err": err, "host": v.need(c, "rpc", "VELA_RPC_URL"), "owner": "", "eth": "", "token": v.app_token(c), "token_balance": "", "app_id": s["app_id"], "trigger": s["trigger"], "deployed": s["app_id"] != "",
+              "agent": s["agent"], "balance": "", "allowance": "", "max_auto": "", "payees": [], "pending": [], "events": [], "receipts": [], "note": ""}
+    try
+        set d["owner"] to v.me()
+        set d["eth"] to v.from_units(text(eth_balance(c["rpc"], d["owner"])), 18)
+        set d["token_balance"] to human(c, v.token_balance_of(c, d["token"], d["owner"]))
+    recover e
+        set d["note"] to "the stack does not answer: " + text(e)
+    when d["deployed"]
+        try
+            let dec be v.token_decimals(c)
+            let keys be p521_pair(s)
+            let seen be {}
+            each item in v.events_with(c, keys["key"], owner(), 30)
+                when contains(item, "event") and contains(item["event"], "type")
+                    let ev be humanize(item["event"], dec)
+                    when d["balance"] == "" and contains(ev, "balance")
+                        set d["balance"] to ev["balance"]
+                    when d["allowance"] == "" and contains(ev, "allowance")
+                        set d["allowance"] to ev["allowance"]
+                    when d["max_auto"] == "" and contains(ev, "max_auto")
+                        set d["max_auto"] to ev["max_auto"]
+                    -- the latest word on each proposal decides whether it still waits
+                    when contains(ev, "proposal")
+                        let p be ev["proposal"]
+                        when not contains(seen, p["id"])
+                            set seen[p["id"]] to true
+                            when ev["type"] == "approval_needed"
+                                set d["pending"] to append(d["pending"], {"n": text(p["n"]), "payee": p["payee"], "amount": p["amount"], "memo": p["memo"], "reasons": join(p["reasons"], "; ")})
+                    let line be ev["type"]
+                    when contains(ev, "proposal")
+                        set line to line + " · #" + text(ev["proposal"]["n"]) + " · " + ev["proposal"]["amount"] + " to " + ev["proposal"]["payee"] + (when ev["proposal"]["memo"] == "" then "" otherwise " · " + ev["proposal"]["memo"]) + (when length(ev["proposal"]["reasons"]) == 0 then "" otherwise " · " + join(ev["proposal"]["reasons"], "; "))
+                    otherwise when contains(ev, "changes")
+                        set line to line + " · " + join(ev["changes"], "; ")
+                    otherwise when contains(ev, "amount")
+                        set line to line + " · " + ev["amount"]
+                    set d["events"] to append(d["events"], {"block": item["block"], "line": line})
+            each item in v.app_events(c, 8)
+                when item["label"] == "payment"
+                    let r be abi_decode("(bytes16,address,address,uint256)", v.hex_bytes(item["data"]))
+                    set d["receipts"] to append(d["receipts"], {"n": text(bytes_to_int(r[0])), "payee": lower(r[1]), "amount": human(c, r[3]), "block": item["block"]})
+        recover e
+            set d["note"] to "could not read the enclave's events: " + text(e)
+        each p in s["payees"]
+            let bal be ""
+            try
+                set bal to human(c, v.token_balance_of(c, d["token"], p["address"]))
+            recover e
+                set bal to "?"
+            set d["payees"] to append(d["payees"], {"address": p["address"], "label": p["label"], "wallet": bal})
+    give render("pages/home.html", d)
+
+serve on 8080
+    timeout 300
+    route "GET /"
+        give overview(load(), text(field(query, "ok", "")), text(field(query, "err", "")))
+    route "POST /deploy"
+        let f be form of request
+        try
+            give back(do_deploy(load(), text(field(f, "max_auto", "200")), text(field(f, "allowance", "500"))), "")
+        recover err
+            give back("", "deploy failed: " + text(err))
+    route "POST /fund"
+        try
+            give back(do_fund(load(), trim(text(field(form of request, "amount", "")))), "")
+        recover err
+            give back("", "funding failed: " + text(err))
+    route "POST /policy"
+        try
+            give back(do_policy(load(), form of request), "")
+        recover err
+            give back("", "the policy change failed: " + text(err))
+    route "POST /payees"
+        try
+            give back(do_payee(load(), form of request), "")
+        recover err
+            give back("", "the payee could not be allowed: " + text(err))
+    route "POST /propose"
+        try
+            give back(do_propose(load(), form of request), "")
+        recover err
+            give back("", "the proposal failed: " + text(err))
+    route "POST /proposals/:n/approve"
+        try
+            give back(do_decide(load(), "approve", params.n, ""), "")
+        recover err
+            give back("", "the approval failed: " + text(err))
+    route "POST /proposals/:n/reject"
+        try
+            give back(do_decide(load(), "reject", params.n, text(field(form of request, "reason", ""))), "")
+        recover err
+            give back("", "the rejection failed: " + text(err))

@@ -7,7 +7,8 @@ build/
 # keys, addresses and tokens: every client/.env* except the example
 client/.env*
 !client/.env.example
-# the agent's .env at the root, except the example
+# the console's state and the guest it cached (a volume on the platform); the .env at the root, except the example
+/data/
 /.env*
 !/.env.example
 # invoices: real ones stay local; the folders exist through .gitkeep

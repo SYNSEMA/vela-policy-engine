@@ -17,8 +17,18 @@ if [ ! -d lib/vela ]; then
   git clone -q --depth 1 --branch "$VELA_TAG" https://github.com/HorizenOfficial/vela.git lib/vela
 fi
 forge build
-forge create src/TreasuryTrigger.sol:TreasuryTrigger \
-  --rpc-url "$RPC_URL" --private-key "$PRIVATE_KEY" --broadcast \
-  --constructor-args "$PROCESSOR" | tee deploy.log
-grep -o 'Deployed to: 0x[0-9a-fA-F]*' deploy.log | cut -d' ' -f3 > trigger.address
-echo "TreasuryTrigger at $(cat trigger.address)"
+# WHAT=factory deploys the factory (once per stack: the console makes a trigger per app through it);
+# the default deploys one trigger, for the CLI's deploy-treasury.
+if [ "${WHAT:-trigger}" = "factory" ]; then
+  forge create src/TreasuryTriggerFactory.sol:TreasuryTriggerFactory \
+    --rpc-url "$RPC_URL" --private-key "$PRIVATE_KEY" --broadcast \
+    --constructor-args "$PROCESSOR" | tee deploy.log
+  grep -o 'Deployed to: 0x[0-9a-fA-F]*' deploy.log | cut -d' ' -f3 > factory.address
+  echo "TreasuryTriggerFactory at $(cat factory.address)"
+else
+  forge create src/TreasuryTrigger.sol:TreasuryTrigger \
+    --rpc-url "$RPC_URL" --private-key "$PRIVATE_KEY" --broadcast \
+    --constructor-args "$PROCESSOR" | tee deploy.log
+  grep -o 'Deployed to: 0x[0-9a-fA-F]*' deploy.log | cut -d' ' -f3 > trigger.address
+  echo "TreasuryTrigger at $(cat trigger.address)"
+fi

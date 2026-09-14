@@ -25,6 +25,7 @@ jobs:
         run: |
           synsema test app/app.syn
           (cd client && synsema test vela_client.syn)
+          synsema check web.syn
           synsema check agent.syn
           synsema test scripts/embed.syn
       - name: Build the guest (the release's module + app/app.syn)
