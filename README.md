@@ -163,7 +163,7 @@ held, approved or rejected, and the reasons.
   id, a new ledger, and needs a new trigger (the console makes one).
 - Deploying needs `DEPLOYER_ROLE`; the token needs `TokenAllowlist.addAllowedToken`; the auditor
   needs `DefaultAuthority.addAllowedAuthority(appId, address)` from the admin, per application
-  (`vela_client.syn -- allow-authority <appId> <address>`; on the devnet the admin key comes as `VELA_ADMIN_KEY`).
+  (`vela_client.syn -- allow-authority <appId> <address>`; on the devnet `VELA_ADMIN_URL` signs it for you).
 - Amounts are the token's smallest unit as text inside the enclave; the console and the client convert.
 - Node 22 crashes intermittently inside V8 running this module; use Node 20 or 24+.
 - On Windows, run the scripts from Git Bash.

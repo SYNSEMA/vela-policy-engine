@@ -92,6 +92,6 @@ cd "$ROOT/client"
 wait_balance "$VENDOR" 420
 echo "== the agent's outcomes"; agent outcomes 4
 echo "== the owner's ledger (events)"; run proposals 6
-echo "== allow-authority: the owner becomes an auditor of this app (the signing key is the admin on a devnet)"; run allow-authority "$APP_ID" "$OWNER"
+echo "== allow-authority: the owner becomes an auditor of this app (the devnet's admin desk signs it)"; run allow-authority "$APP_ID" "$OWNER"
 echo "== audit"; run audit
 echo "done: VELA_APP_ID=$APP_ID is in client/.env and .env (the agent's)"
