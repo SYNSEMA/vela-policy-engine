@@ -76,8 +76,44 @@ task field(m, key, default)
         give m[key]
     give default
 
+-- ---- for people: grouped digits, no trailing zeros, short addresses, the stack's host ----
+
+task group(intp)
+    let out be ""
+    let i be length(intp)
+    while i > 3
+        set out to "," + slice(intp, i - 3, i) + out
+        set i to i - 3
+    give slice(intp, 0, i) + out
+
+task nice(t)
+    let parts be split(text(t), ".")
+    let dec be when length(parts) > 1 then parts[1] otherwise ""
+    when length(dec) > 6
+        set dec to slice(dec, 0, 6)
+    while length(dec) > 0 and slice(dec, length(dec) - 1, length(dec)) == "0"
+        set dec to slice(dec, 0, length(dec) - 1)
+    give group(parts[0]) + (when dec == "" then "" otherwise "." + dec)
+
+task short(address)
+    let a be text(address)
+    when length(a) < 12
+        give a
+    give slice(a, 0, 6) + "…" + slice(a, length(a) - 4, length(a))
+
+-- every address in a sentence, shortened
+task shorten(msg)
+    let out be text(msg)
+    each m in unique(find_all(out, "0x[0-9a-fA-F]{40}"))
+        set out to replace_text(out, m, short(m))
+    give out
+
+task host_of(url)
+    let u be replace_text(replace_text(text(url), "https://", ""), "http://", "")
+    give split(u, "/")[0]
+
 task human(c, u)
-    give v.from_units(text(u), v.token_decimals(c))
+    give nice(v.from_units(text(u), v.token_decimals(c)))
 
 task units(c, tokens)
     give v.to_units(tokens, v.token_decimals(c))
@@ -103,7 +139,7 @@ task back(ok, err)
 task in_tokens(msg, d)
     let out be msg
     each m in unique(find_all(msg, "\b[0-9]+\b"))
-        set out to replace_text(out, m, v.from_units(m, d))
+        set out to replace_text(out, m, nice(v.from_units(m, d)))
     give out
 
 task in_tokens_all(items, d)
@@ -115,14 +151,14 @@ task in_tokens_all(items, d)
 task humanize(ev, d)
     each key in ["amount", "balance", "allowance", "max_auto"]
         when contains(ev, key) and ev[key] != nothing and matches(text(ev[key]), "[0-9]+")
-            set ev[key] to v.from_units(ev[key], d)
+            set ev[key] to nice(v.from_units(ev[key], d))
     when contains(ev, "reasons")
         set ev["reasons"] to in_tokens_all(ev["reasons"], d)
     when contains(ev, "changes")
         set ev["changes"] to in_tokens_all(ev["changes"], d)
     when contains(ev, "proposal") and ev["proposal"] != nothing
         let p be ev["proposal"]
-        set p["amount"] to v.from_units(p["amount"], d)
+        set p["amount"] to nice(v.from_units(p["amount"], d))
         set p["reasons"] to in_tokens_all(p["reasons"], d)
         set ev["proposal"] to p
     give ev
@@ -237,15 +273,16 @@ task do_decide(s, kind, n, why)
 
 task overview(s, ok, err)
     let c be config(s)
-    let d be {"ok": ok, "err": err, "host": v.need(c, "rpc", "VELA_RPC_URL"), "owner": "", "eth": "", "token": c["token"], "token_balance": "", "app_id": s["app_id"], "trigger": s["trigger"], "deployed": s["app_id"] != "",
-              "agent": s["agent"], "balance": "", "allowance": "", "max_auto": "", "payees": [], "pending": [], "events": [], "receipts": [], "note": ""}
+    let d be {"ok": ok, "err": err, "host": host_of(v.need(c, "rpc", "VELA_RPC_URL")), "owner": "", "owner_short": "", "eth": "", "token": c["token"], "token_short": short(c["token"]), "token_balance": "", "app_id": s["app_id"], "trigger": s["trigger"], "trigger_short": short(s["trigger"]), "deployed": s["app_id"] != "",
+              "agent": s["agent"], "agent_short": short(s["agent"]), "balance": "", "allowance": "", "max_auto": "", "payees": [], "pending": [], "events": [], "receipts": [], "note": ""}
     -- without the stack's token there is nothing to fund or pay with: say so instead of failing
     when c["token"] == ""
         set d["note"] to "VELA_TOKEN is empty: the environment was not provisioned. Set it (the devnet hands it out as VELA_TEST_TOKEN) and redeploy."
         give render("pages/home.html", d)
     try
         set d["owner"] to v.me()
-        set d["eth"] to v.from_units(text(eth_balance(c["rpc"], d["owner"])), 18)
+        set d["owner_short"] to short(d["owner"])
+        set d["eth"] to nice(v.from_units(text(eth_balance(c["rpc"], d["owner"])), 18))
         set d["token_balance"] to human(c, v.token_balance_of(c, d["token"], d["owner"]))
     recover e
         set d["note"] to "the stack does not answer: " + text(e)
@@ -269,7 +306,7 @@ task overview(s, ok, err)
                         when not contains(seen, p["id"])
                             set seen[p["id"]] to true
                             when ev["type"] == "approval_needed"
-                                set d["pending"] to append(d["pending"], {"n": text(p["n"]), "payee": p["payee"], "amount": p["amount"], "memo": p["memo"], "reasons": join(p["reasons"], "; ")})
+                                set d["pending"] to append(d["pending"], {"n": text(p["n"]), "payee": p["payee"], "payee_short": short(p["payee"]), "amount": p["amount"], "memo": p["memo"], "reasons": join(p["reasons"], "; ")})
                     let line be ev["type"]
                     when contains(ev, "proposal")
                         set line to line + " · #" + text(ev["proposal"]["n"]) + " · " + ev["proposal"]["amount"] + " to " + ev["proposal"]["payee"] + (when ev["proposal"]["memo"] == "" then "" otherwise " · " + ev["proposal"]["memo"]) + (when length(ev["proposal"]["reasons"]) == 0 then "" otherwise " · " + join(ev["proposal"]["reasons"], "; "))
@@ -277,11 +314,11 @@ task overview(s, ok, err)
                         set line to line + " · " + join(ev["changes"], "; ")
                     otherwise when contains(ev, "amount")
                         set line to line + " · " + ev["amount"]
-                    set d["events"] to append(d["events"], {"block": item["block"], "line": line})
+                    set d["events"] to append(d["events"], {"block": item["block"], "line": shorten(line)})
             each item in v.app_events(c, 8)
                 when item["label"] == "payment"
                     let r be abi_decode("(bytes16,address,address,uint256)", v.hex_bytes(item["data"]))
-                    set d["receipts"] to append(d["receipts"], {"n": text(bytes_to_int(r[0])), "payee": lower(r[1]), "amount": human(c, r[3]), "block": item["block"]})
+                    set d["receipts"] to append(d["receipts"], {"n": text(bytes_to_int(r[0])), "payee": lower(r[1]), "payee_short": short(lower(r[1])), "amount": human(c, r[3]), "block": item["block"]})
         recover e
             set d["note"] to "could not read the enclave's events: " + text(e)
         each p in s["payees"]
@@ -290,7 +327,7 @@ task overview(s, ok, err)
                 set bal to human(c, v.token_balance_of(c, d["token"], p["address"]))
             recover e
                 set bal to "?"
-            set d["payees"] to append(d["payees"], {"address": p["address"], "label": p["label"], "wallet": bal})
+            set d["payees"] to append(d["payees"], {"address": p["address"], "short": short(p["address"]), "label": p["label"], "wallet": bal})
     give render("pages/home.html", d)
 
 serve on 8080
