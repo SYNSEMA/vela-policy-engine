@@ -86,7 +86,11 @@ task encrypted(c, keys, plain)
     give v.seal(v.derive_key(keys["key"], v.tee_public_key(c)), bytes(json_encode(plain)))
 
 task qs(msg)
-    let m be replace_text(replace_text(replace_text(replace_text(replace_text(text(msg), "%", " pct"), "&", " and "), "#", " "), "?", " "), "+", " plus ")
+    let m be replace_text(text(msg), "%", "%25")
+    set m to replace_text(m, "&", "%26")
+    set m to replace_text(m, "#", "%23")
+    set m to replace_text(m, "+", "%2B")
+    set m to replace_text(m, "?", "%3F")
     give replace_text(trim(m), " ", "+")
 
 task back(ok, err)
@@ -233,8 +237,12 @@ task do_decide(s, kind, n, why)
 
 task overview(s, ok, err)
     let c be config(s)
-    let d be {"ok": ok, "err": err, "host": v.need(c, "rpc", "VELA_RPC_URL"), "owner": "", "eth": "", "token": v.app_token(c), "token_balance": "", "app_id": s["app_id"], "trigger": s["trigger"], "deployed": s["app_id"] != "",
+    let d be {"ok": ok, "err": err, "host": v.need(c, "rpc", "VELA_RPC_URL"), "owner": "", "eth": "", "token": c["token"], "token_balance": "", "app_id": s["app_id"], "trigger": s["trigger"], "deployed": s["app_id"] != "",
               "agent": s["agent"], "balance": "", "allowance": "", "max_auto": "", "payees": [], "pending": [], "events": [], "receipts": [], "note": ""}
+    -- without the stack's token there is nothing to fund or pay with: say so instead of failing
+    when c["token"] == ""
+        set d["note"] to "VELA_TOKEN is empty: the environment was not provisioned. Set it (the devnet hands it out as VELA_TEST_TOKEN) and redeploy."
+        give render("pages/home.html", d)
     try
         set d["owner"] to v.me()
         set d["eth"] to v.from_units(text(eth_balance(c["rpc"], d["owner"])), 18)
