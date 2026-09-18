@@ -36,7 +36,7 @@
 --   synsema run vela_client.syn -- deploy <wasm> [params-json|-] [trigger] | register | deposit <amount> [token]
 --   synsema run vela_client.syn -- send '<json>' [wei] | report '<json>' | report-download <id> | events [n] | app-events [n] | status <id>
 --   synsema run vela_client.syn -- register-for | send-for '<json>' [amount token] | events-for [n]   (the facilitator: VELA_USER_KEY signs, VELA_SECP_KEY pays)
-intent: "vela client: the treasury's owner, its proposers and anyone else — on top of the protocol module"
+intent: "vela client: the policy engine's owner, its proposers and anyone else — on top of the protocol module"
 
 require net("localhost")
 require net("127.0.0.1")

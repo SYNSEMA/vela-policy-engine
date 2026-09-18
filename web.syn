@@ -1,4 +1,4 @@
--- web.syn — the treasury console: the owner sets the policy, watches what the agent proposes,
+-- web.syn — the policy engine's console: the owner sets the policy, watches what the agent proposes,
 -- approves or rejects what the policy held, and sees every payment settle on-chain — from the
 -- browser. This is the recipe's entry on the Synsema platform (kind = web). The agent lives here
 -- too as a demo proposer with a key of its own (the standalone worker, agent.syn, does the same
@@ -10,7 +10,7 @@
 -- the trigger cycle (about a minute more) before it shows as settled.
 --
 --   synsema serve web.syn            (from the repository root; .env there = `vela_client.syn -- devnet`)
-intent: "treasury console: an agent proposes, the enclave applies the owner's policy, the owner approves — from the browser"
+intent: "payment policy engine console: an agent proposes, the enclave enforces the owner's policy, the owner approves — from the browser"
 
 require serve(8080)
 require net("localhost")

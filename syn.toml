@@ -1,19 +1,19 @@
-# Agent treasury on Vela (Horizen) as a recipe: the entry is the treasury console (web.syn), a web app
+# A payment policy engine on Vela (Horizen) as a recipe: the entry is the owner's console (web.syn), a web app
 # that makes a trigger contract through the factory on the stack, embeds app/app.syn into the
 # release's guest module, deploys it to Vela and runs the treasury from the browser: policy, payees,
 # the agent's proposals, approvals, and every payment as the chain sees it. This file only says what
 # the code cannot say about itself; the `require` blocks are the manifests of capabilities. The
 # standalone agent (agent.syn) and the owner's CLI (client/) do the same from a terminal.
 
-name = "Agent treasury on Vela"
-slug = "vela-treasury"
-version = "0.2.4"
+name = "Payment policy engine"
+slug = "vela-policy-engine"
+version = "0.3.0"
 kind = "web"
 entry = "web.syn"
 engine = "0.6"
-tagline = "An agent proposes payments, the enclave applies the owner's policy, a contract pays: LLM outside, policy inside, on Horizen's Vela."
-tagline_es = "Un agente propone pagos, el enclave aplica la política del dueño, un contrato paga: LLM afuera, política adentro, en Vela (Horizen)."
-tagline_pt = "Um agente propõe pagamentos, o enclave aplica a política do dono, um contrato paga: LLM fora, política dentro, no Vela (Horizen)."
+tagline = "A payment policy engine on Horizen's Vela, in Synsema: an AI agent reviews invoices and proposes payments, the enclave enforces the spending policy (allowed payees, caps, an automatic limit, approvals) and a contract pays. The agent never holds a key."
+tagline_es = "Un motor de políticas de pago en Vela (Horizen) con Synsema: un agente de IA revisa facturas y propone pagos, el enclave aplica la política de gasto (proveedores permitidos, topes, límite automático, aprobaciones) y un contrato paga. El agente nunca tiene una clave."
+tagline_pt = "Um motor de políticas de pagamento no Vela (Horizen) com Synsema: um agente de IA revisa faturas e propõe pagamentos, o enclave aplica a política de gastos (beneficiários permitidos, tetos, limite automático, aprovações) e um contrato paga. O agente nunca tem uma chave."
 
 [secrets]
 VELA_SECP_KEY = "the owner's secp256k1 key: signs the transactions and pays the fees (hex). On the public devnet the token comes with an account of its own: a deployer with ETH and test tokens."

@@ -1,10 +1,11 @@
-# vela-treasury — an agent treasury on Vela (Horizen), in Synsema
+# vela-policy-engine — a payment policy engine on Vela (Horizen), in Synsema
 
-An agent proposes payments. The enclave applies the owner's policy — who may propose, who may be
-paid and up to how much, the automatic limit per payment, the allowance the owner granted — and
-either pays at once through a trigger contract or holds the proposal for the owner. Every decision
-is deterministic, every proposal lands in an audit report, and the agent never holds a key that
-can move the funds. **LLM outside, policy inside**, in the same language on both sides.
+An AI agent reviews invoices and proposes payments. The enclave enforces the owner's spending
+policy — who may propose, who may be paid and up to how much, the automatic limit per payment, the
+allowance the owner granted — and either pays at once through a trigger contract or holds the
+proposal for the owner. Every decision is deterministic, every proposal lands in an audit report,
+and the agent never holds a key that can move the funds. **LLM outside, policy inside**, in the
+same language on both sides. The funds the policy governs are called the treasury below.
 
 ```
 the agent — outside: turns an invoice into a proposal, signed with the AGENT's key
