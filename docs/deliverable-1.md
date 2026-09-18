@@ -1,6 +1,6 @@
 # Synsema on Vela — Deliverable 1
 
-*Horizen Acceleration Season, week 2. September 18, 2026. Repo: https://github.com/SYNSEMA/vela-policy-engine · docs: https://synsema.dev/en/0.6.x/73-vela · devnet: https://devnet.synsema.app/ · video: `[link added at submission]`*
+*Horizen Acceleration Season, week 2. September 18, 2026. Repo: https://github.com/SYNSEMA/vela-policy-engine · docs: https://synsema.dev/en/0.6.x/73-vela · devnet: https://devnet.synsema.app/ · video: https://youtu.be/XPh98EWemzY*
 
 ## The problem, in the buyer's words
 
