@@ -12,7 +12,7 @@
 --   synsema serve web.syn            (from the repository root; .env there = `vela_client.syn -- devnet`)
 intent: "payment policy engine console: an agent proposes, the enclave enforces the owner's policy, the owner approves — from the browser"
 
-require serve(8080)
+require serve(8090)
 require net("localhost")
 require net("127.0.0.1")
 require net("devnet.synsema.app")
@@ -330,7 +330,7 @@ task overview(s, ok, err)
             set d["payees"] to append(d["payees"], {"address": p["address"], "short": short(p["address"]), "label": p["label"], "wallet": bal})
     give render("pages/home.html", d)
 
-serve on 8080
+serve on 8090
     timeout 300
     route "GET /"
         give overview(load(), text(field(query, "ok", "")), text(field(query, "err", "")))
