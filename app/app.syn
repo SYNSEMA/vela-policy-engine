@@ -616,8 +616,8 @@ test "an unknown instruction is an error, never a silent no-op"
     assert_eq(send(treasury(), CFO, {"type": "mint"})["error"], "unknown_type")
     assert_eq(send(treasury(), CFO, {"amount": "1"})["error"], "missing_type")
 
--- Maps are shared by reference and a successful call mutates the state it was given: snapshot
--- `before` with a deep copy when a test needs both sides of a transition.
+-- Maps are values since v0.6.29: a call never changes the state it was given, so `before` is safe
+-- as it is. The deep copy stays as a snapshot that does not depend on that guarantee.
 task copy(v)
     give json_decode(json_encode(v))
 

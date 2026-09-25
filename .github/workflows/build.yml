@@ -6,7 +6,7 @@ name: treasury guest
 on: [push, pull_request, workflow_dispatch]
 
 env:
-  SYNSEMA_TAG: v0.6.23
+  SYNSEMA_TAG: v0.6.29
   # The Go probe sends a process_request; set repository variables if your app's instructions differ.
   DEPLOY_PARAMS: ${{ vars.VELA_DEPLOY_PARAMS || '{"owner":"0x1111111111111111111111111111111111111111","triggerContract":"0x5555555555555555555555555555555555555555"}' }}
   PAYLOAD: ${{ vars.VELA_SMOKE_PAYLOAD || '{"type":"policy","grant":"1000","allow_proposer":{"address":"0x2222222222222222222222222222222222222222","label":"ci"}}' }}

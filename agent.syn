@@ -74,7 +74,7 @@ task extract(content, name)
     let answer be generate "exactly one JSON object with the keys payee (the 0x address to pay), amount (the amount as a decimal number in a string, in tokens) and memo (the invoice number or a short description, at most 60 characters), and nothing else" given content
     let raw be trim(text(answer))
     when starts_with(raw, "```")
-        set raw to trim(replace_text(replace_text(raw, "```json", ""), "```", ""))
+        set raw to trim(replace(replace(raw, "```json", ""), "```", ""))
     try
         let inv be invoice_of(json_decode(raw), name)
         when inv == nothing

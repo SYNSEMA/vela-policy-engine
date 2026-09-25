@@ -99,8 +99,8 @@ task instruct(c, plain)
 -- inside the reasons come out converted with the token's decimals.
 task in_tokens(msg, d)
     let out be msg
-    each m in unique(find_all(msg, "[0-9]+"))
-        set out to replace_text(out, m, v.from_units(m, d))
+    each m in unique(regex_find_all(msg, "[0-9]+"))
+        set out to replace(out, m, v.from_units(m, d))
     give out
 
 task in_tokens_all(items, d)
@@ -218,7 +218,7 @@ task run_cli(a)
         is "user-keys"
             let k be decode(random_bytes(32), "hex")
             print("VELA_USER_KEY=" + k)
-            print("address " + eth_address(as_secret(k, "VELA_USER_KEY")))
+            print("address " + evm_address(as_secret(k, "VELA_USER_KEY")))
         is "deploy"
             let params be when length(a) > 2 and a[2] != "-" then json_decode(a[2]) otherwise nothing
             let trigger be arg_or(a, 3, nothing)
@@ -363,7 +363,7 @@ test "the facilitator's typed data digests are 32 bytes and change with every fi
     assert_eq(length(p1), 32)
     assert(p1 != v.permit_digest(31337, processor, "Test Token", user, processor, 1000000, 1, 1800000000))
     let k be as_secret("ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80", "VELA_USER_KEY")
-    let sig be v.eth_signature(d1, k)
+    let sig be v.sign_eth(d1, k)
     assert_eq(length(sig), 65)
     assert(sig[64] == 27 or sig[64] == 28)
     assert_eq(length(v.permit_bytes(sig)), 96)

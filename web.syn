@@ -38,7 +38,9 @@ use "./scripts/embed_lib.syn" as slot
 let ETH be "0x0000000000000000000000000000000000000000"
 let PROCESS be 1
 let ASSOCIATE_KEY be 3
-let GUEST_TAG be env("SYNSEMA_GUEST_TAG", "v0.6.23")
+let GUEST_TAG be env("SYNSEMA_GUEST_TAG", "v0.6.29")
+-- The guest cached per release: bumping GUEST_TAG downloads the new one instead of reusing the old.
+let GUEST_CACHE be "data/guest-" + GUEST_TAG + ".wasm"
 let STATE be "data/treasury.json"
 
 task load()
@@ -55,15 +57,23 @@ task config(s)
         set c["app_id"] to s["app_id"]
     give c
 
+-- The state with this console's P-521 key, created (and saved) the first time. Maps are values:
+-- a task that goes on to change `s` and save it must take this one back (`set s to with_p521(s)`),
+-- or its save would write the state without the key and the next request would make another.
+task with_p521(s)
+    when env("VELA_P521_KEY", "") != "" or s["p521_key"] != ""
+        give s
+    let kp be ecdh_keypair("P-521")
+    set s["p521_key"] to decode(reveal(kp["private"]), "hex")
+    set s["p521_pub"] to decode(kp["public"], "hex")
+    save(s)
+    give s
+
 task p521_pair(s)
     when env("VELA_P521_KEY", "") != ""
         give {"key": v.p521_key(), "pub": v.p521_public()}
-    when s["p521_key"] == ""
-        let kp be ecdh_keypair("P-521")
-        set s["p521_key"] to decode(reveal(kp["private"]), "hex")
-        set s["p521_pub"] to decode(kp["public"], "hex")
-        save(s)
-    give {"key": v.p521_of(s["p521_key"]), "pub": v.hex_bytes(s["p521_pub"])}
+    let k be with_p521(s)
+    give {"key": v.p521_of(k["p521_key"]), "pub": v.hex_bytes(k["p521_pub"])}
 
 task owner()
     give v.secp_key()
@@ -104,12 +114,12 @@ task short(address)
 -- every address in a sentence, shortened
 task shorten(msg)
     let out be text(msg)
-    each m in unique(find_all(out, "0x[0-9a-fA-F]{40}"))
-        set out to replace_text(out, m, short(m))
+    each m in unique(regex_find_all(out, "0x[0-9a-fA-F]{40}"))
+        set out to replace(out, m, short(m))
     give out
 
 task host_of(url)
-    let u be replace_text(replace_text(text(url), "https://", ""), "http://", "")
+    let u be replace(replace(text(url), "https://", ""), "http://", "")
     give split(u, "/")[0]
 
 task human(c, u)
@@ -122,12 +132,12 @@ task encrypted(c, keys, plain)
     give v.seal(v.derive_key(keys["key"], v.tee_public_key(c)), bytes(json_encode(plain)))
 
 task qs(msg)
-    let m be replace_text(text(msg), "%", "%25")
-    set m to replace_text(m, "&", "%26")
-    set m to replace_text(m, "#", "%23")
-    set m to replace_text(m, "+", "%2B")
-    set m to replace_text(m, "?", "%3F")
-    give replace_text(trim(m), " ", "+")
+    let m be replace(text(msg), "%", "%25")
+    set m to replace(m, "&", "%26")
+    set m to replace(m, "#", "%23")
+    set m to replace(m, "+", "%2B")
+    set m to replace(m, "?", "%3F")
+    give replace(trim(m), " ", "+")
 
 task back(ok, err)
     when err != ""
@@ -138,8 +148,8 @@ task back(ok, err)
 -- the digits inside an address stay)
 task in_tokens(msg, d)
     let out be msg
-    each m in unique(find_all(msg, "\b[0-9]+\b"))
-        set out to replace_text(out, m, nice(v.from_units(m, d)))
+    each m in unique(regex_find_all(msg, "\b[0-9]+\b"))
+        set out to replace(out, m, nice(v.from_units(m, d)))
     give out
 
 task in_tokens_all(items, d)
@@ -178,17 +188,18 @@ task make_trigger(c)
 
 task do_deploy(s, max_auto, allowance)
     let c be config(s)
+    set s to with_p521(s)
     let keys be p521_pair(s)
     when s["agent_key"] == ""
         set s["agent_key"] to decode(random_bytes(32), "hex")
-        set s["agent"] to eth_address(agent_key(s))
+        set s["agent"] to evm_address(agent_key(s))
         save(s)
     let guest be nothing
-    when file_exists("data/guest.wasm")
-        set guest to read_file_bytes("data/guest.wasm")
+    when file_exists(GUEST_CACHE)
+        set guest to read_file_bytes(GUEST_CACHE)
     otherwise
         set guest to slot.release_guest(GUEST_TAG)
-        write_file("data/guest.wasm", guest)
+        write_file(GUEST_CACHE, guest)
     -- the trigger is kept as soon as it exists: a deploy that fails after it is retried with the same one
     let trigger be s["trigger"]
     when trigger == ""
@@ -282,7 +293,7 @@ task overview(s, ok, err)
     try
         set d["owner"] to v.me()
         set d["owner_short"] to short(d["owner"])
-        set d["eth"] to nice(v.from_units(text(eth_balance(c["rpc"], d["owner"])), 18))
+        set d["eth"] to nice(v.from_units(text(evm_balance(c["rpc"], d["owner"])), 18))
         set d["token_balance"] to human(c, v.token_balance_of(c, d["token"], d["owner"]))
     recover e
         set d["note"] to "the stack does not answer: " + text(e)
